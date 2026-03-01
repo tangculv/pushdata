@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Database
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-journal
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Excel temporary files
+.~*
+
+# Logs
+*.log
+.cursor/debug.log
+
+# Config (if contains sensitive data)
+# siyu_etl_config.json
+
+# Node modules (for Electron)
+node_modules/
+apps/*/node_modules/

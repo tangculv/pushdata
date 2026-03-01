@@ -1,0 +1,19 @@
+{
+  "platform_key": "f5edd587da7166bdcc6967dc2532e5aa6bcac92a09b1c3144ee05ad3e514bbf7",
+  "batch_size": 100,
+  "request_timeout_seconds": 30,
+  "dry_run": false,
+  "archive_to_processed_dir": false,
+  "archive_suffix": "_processed",
+  "data_dir": "data",
+  "db_path": "siyu_etl.sqlite3",
+  "last_open_dir": "/Users/chengxiaoming/Downloads/山禾田 1 月数据",
+  "webhooks": {
+    "member_trade_detail": "https://cs.mlkee.com/api/workflow/hooks/Njk3MjQzYjM0ZTIwN2EwZGE1NDk2ZWUw",
+    "income_discount_stat": "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzI3YWJkMDlkNGFkYTFjOTYzZTIw",
+    "coupon_stat": "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzI3YWZkMDlkNGFkYTFjOTY0M2My",
+    "in_store_order_detail": "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzIyY2ZkMDlkNGFkYTFjOTU2NTc3",
+    "member_storage_analysis": "https://cs.mlkee.com/api/workflow/hooks2/Njk3OWNhYjZkMDlkNGFkYTFjNTNiMDk5",
+    "member_card_export": "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzJkY2NkMDlkNGFkYTFjOTczMzg1"
+  }
+}
