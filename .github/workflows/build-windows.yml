@@ -1,7 +1,9 @@
-# Build Windows executable for Siyu ETL Client.
-# Run on push to main (or manually); artifact: siyu-etl-windows.zip
+# Build desktop artifacts for Siyu ETL Client.
+# Artifacts:
+# - siyu-etl-windows.zip
+# - siyu-etl-macos-intel.zip
 
-name: Build Windows
+name: Build Desktop Apps
 
 on:
   push:
@@ -10,6 +12,7 @@ on:
 
 jobs:
   build-windows:
+    name: Build Windows
     runs-on: windows-latest
 
     steps:
@@ -43,3 +46,44 @@ jobs:
         with:
           name: siyu-etl-windows
           path: siyu-etl-windows.zip
+
+  build-macos-intel:
+    name: Build macOS Intel
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tkinter support
+        run: |
+          brew update
+          brew install python-tk
+
+      - name: Install dependencies
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build app bundle
+        run: |
+          source .venv/bin/activate
+          pyinstaller --noconfirm --windowed --name SiyuETL main.py
+
+      - name: Zip app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/SiyuETL.app siyu-etl-macos-intel.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siyu-etl-macos-intel
+          path: siyu-etl-macos-intel.zip
