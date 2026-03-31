@@ -49,7 +49,7 @@ jobs:
 
   build-macos-intel:
     name: Build macOS Intel
-    runs-on: macos-lastest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
