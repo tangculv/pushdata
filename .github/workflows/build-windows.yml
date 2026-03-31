@@ -25,17 +25,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        shell: powershell
         run: |
           python -m venv .venv
-          .venv\Scripts\activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install pyinstaller
 
       - name: Build with PyInstaller
+        shell: powershell
         run: |
-          .venv\Scripts\activate
-          pyinstaller siyu.spec
+          .\.venv\Scripts\pyinstaller.exe siyu.spec
+
 
       - name: Zip dist
         run: |
