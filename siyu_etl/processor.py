@@ -15,9 +15,31 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from siyu_etl.archive import archive_file
+from siyu_etl.batch_service import BatchService
 from siyu_etl.circuit_breaker import CircuitBreaker
 from siyu_etl.config import AppConfig
-from siyu_etl.db import backfill_pending_store_ids, init_db, insert_task, requeue_skipped_member_trade_with_store_id
+from siyu_etl.db import (
+    FILE_STATUS_PARSE_FAILED,
+    FILE_STATUS_PARSING,
+    FILE_STATUS_READY_TO_UPLOAD,
+    FILE_STATUS_STOPPED,
+    FILE_STATUS_UPLOAD_FAILED,
+    FILE_STATUS_UPLOAD_SUCCESS,
+    FILE_STATUS_UPLOADING,
+    SESSION_STATUS_COMPLETED,
+    SESSION_STATUS_FAILED,
+    SESSION_STATUS_PARSED,
+    SESSION_STATUS_PARSING,
+    SESSION_STATUS_PARTIAL_FAILED,
+    SESSION_STATUS_STOPPED,
+    SESSION_STATUS_UPLOADING,
+    backfill_pending_store_ids,
+    backfill_pending_store_ids_for_session,
+    init_db,
+    insert_task,
+    requeue_skipped_member_trade_with_store_id,
+    requeue_skipped_member_trade_with_store_id_for_session,
+)
 from siyu_etl.excel_detect import detect_sheet
 from siyu_etl.excel_read import read_rows
 from siyu_etl.fingerprint import identify_row
@@ -27,56 +49,26 @@ from siyu_etl.uploader import CircuitOpenError, NoResponseStopError, send_batch,
 
 @dataclass(frozen=True)
 class ParseStats:
-    """
-    解析统计信息
-    
-    Attributes:
-        parsed_rows: 解析的行数
-        inserted_rows: 插入的行数
-        duplicate_rows: 重复的行数
-        skipped_rows: 跳过的行数
-    """
     parsed_rows: int
     inserted_rows: int
     duplicate_rows: int
     skipped_rows: int
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
 class RunStats:
-    """
-    运行统计信息
-    
-    Attributes:
-        parsed_rows: 解析的行数
-        inserted_rows: 插入的行数
-        duplicate_rows: 重复的行数
-        skipped_rows: 跳过的行数
-        sent_batches: 发送的批次数量
-    """
     parsed_rows: int
     inserted_rows: int
     duplicate_rows: int
     skipped_rows: int
     sent_batches: int
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
 class PushStats:
-    """
-    推送统计信息
-    
-    Attributes:
-        mode: 推送模式（"preview" 或 "real"）
-        pending_rows: 待推送行数
-        total_batches: 总批次数
-        attempted_batches: 尝试推送的批次数
-        success_batches: 成功推送的批次数
-        skipped_batches: 跳过的批次数
-        stopped_reason: 停止原因
-        last_errors: 最近的错误列表（最多20条）
-    """
-    mode: str  # "preview" | "real"
+    mode: str
     pending_rows: int
     total_batches: int
     attempted_batches: int
@@ -84,6 +76,13 @@ class PushStats:
     skipped_batches: int
     stopped_reason: str
     last_errors: list[str]
+    session_id: str = ""
+
+
+def _ensure_session(batch_service: BatchService, file_paths: list[Path], session_id: str | None) -> str:
+    if session_id:
+        return session_id
+    return batch_service.create_session_with_files(file_paths)
 
 
 def _parse_files(
@@ -94,111 +93,189 @@ def _parse_files(
     log: Callable[[str], None],
     progress: Callable[[int, int, str], None],
     stop_flag: Callable[[], bool],
+    session_id: str | None = None,
 ) -> ParseStats:
-    """
-    解析文件并插入到数据库的公共函数
-    
-    Args:
-        cfg: 应用配置
-        db_path: 数据库路径
-        file_paths: 要处理的文件路径列表
-        log: 日志回调函数
-        progress: 进度回调函数
-        stop_flag: 停止标志检查函数
-        
-    Returns:
-        ParseStats 对象，包含解析统计信息
-    """
     init_db(db_path)
-    parsed = inserted = dup = skipped = 0
-    # 全量上传：每行使用唯一 fingerprint，不判重，全部插入
-    insert_seq = 0
+    batch_service = BatchService(db_path)
+    active_session_id = _ensure_session(batch_service, file_paths, session_id)
+    batch_service.update_session_status(
+        session_id=active_session_id,
+        status=SESSION_STATUS_PARSING,
+        started=True,
+    )
 
+    files_by_path = {Path(f.file_path): f for f in batch_service.list_files(active_session_id)}
+    parsed = inserted = dup = skipped = 0
+    insert_seq = 0
     total_files = len(file_paths)
+    session_had_failure = False
+
     for idx, fp in enumerate(file_paths, start=1):
         if stop_flag():
             log("已停止：退出处理")
             break
 
-        log(f"识别文件: {fp.name}")
-        det = detect_sheet(fp)
-        log(f"识别结果: {det.file_type} header_row={det.header_row_0based}")
-        url = webhook_for_file_type(cfg, det.file_type)
-
-        last_ui = 0.0
-        file_row_count = 0
-        file_inserted = 0
-        file_dup = 0
-        file_skipped = 0
-        for rr in read_rows(
-            fp, header_row_0based=det.header_row_0based, headers=det.headers, file_type=det.file_type
-        ):
-            if stop_flag():
-                log("已停止：退出读取")
-                break
-            file_row_count += 1
-            parsed += 1
-
-            ident = identify_row(
-                file_type=det.file_type, row=rr.data, timestamp_column=det.timestamp_column
+        file_record = files_by_path.get(Path(fp))
+        if file_record is None:
+            file_id = batch_service.add_file(
+                session_id=active_session_id,
+                file_path=str(fp),
+                file_name=fp.name,
+                file_size=int(fp.stat().st_size) if fp.exists() else 0,
+                file_mtime=str(int(fp.stat().st_mtime)) if fp.exists() else "",
             )
-            if not ident.store_name:
-                skipped += 1
-                file_skipped += 1
-                continue
-            if not ident.fingerprint:
-                skipped += 1
-                file_skipped += 1
-                continue
+            file_record = batch_service.get_file(file_id)
+            files_by_path[Path(fp)] = file_record
+        assert file_record is not None
 
-            insert_seq += 1
-            fingerprint_unique = f"{ident.fingerprint}#{insert_seq}"
-            res = insert_task(
-                db_path,
-                fingerprint=fingerprint_unique,
-                file_type=det.file_type,
-                store_id=ident.store_id,
-                store_name=ident.store_name,
-                timestamp=ident.timestamp,
-                raw_data=rr.data,
-                webhook_url=url,
-            )
-            if res.inserted:
-                inserted += 1
-                file_inserted += 1
-            else:
-                dup += 1
-                file_dup += 1
-
-            now = time.time()
-            if now - last_ui > 0.3:
-                progress(idx, max(total_files, 1), f"解析 {fp.name} 行={file_row_count}")
-                last_ui = now
-
-        log(
-            f"文件解析完成: {fp.name} 解析行数={file_row_count} "
-            f"插入={file_inserted} 重复={file_dup} 跳过={file_skipped}"
+        batch_service.update_file_status(
+            file_id=file_record.file_id,
+            status=FILE_STATUS_PARSING,
+            current_stage="parsing",
+            parse_error="",
+            upload_error="",
+            parse_rows=0,
+            uploaded_rows=0,
         )
 
-        # archive after parse (skip if already in processed/)
         try:
-            if "processed" in fp.parts:
-                log("已在 processed 目录，跳过归档")
-            elif cfg.archive_to_processed_dir:
-                dst = archive_file(
-                    fp,
-                    to_processed_dir=cfg.archive_to_processed_dir,
-                    suffix=cfg.archive_suffix,
+            log(f"识别文件: {fp.name}")
+            det = detect_sheet(fp)
+            log(f"识别结果: {det.file_type} header_row={det.header_row_0based}")
+            url = webhook_for_file_type(cfg, det.file_type)
+
+            last_ui = 0.0
+            file_row_count = 0
+            file_inserted = 0
+            file_dup = 0
+            file_skipped = 0
+            for rr in read_rows(
+                fp,
+                header_row_0based=det.header_row_0based,
+                headers=det.headers,
+                file_type=det.file_type,
+            ):
+                if stop_flag():
+                    log("已停止：退出读取")
+                    break
+                file_row_count += 1
+                parsed += 1
+
+                ident = identify_row(
+                    file_type=det.file_type,
+                    row=rr.data,
+                    timestamp_column=det.timestamp_column,
                 )
-                log(f"已归档: {dst}")
+                if not ident.store_name or not ident.fingerprint:
+                    skipped += 1
+                    file_skipped += 1
+                    continue
+
+                insert_seq += 1
+                fingerprint_unique = f"{ident.fingerprint}#{insert_seq}"
+                res = insert_task(
+                    db_path,
+                    fingerprint=fingerprint_unique,
+                    file_type=det.file_type,
+                    store_id=ident.store_id,
+                    store_name=ident.store_name,
+                    timestamp=ident.timestamp,
+                    raw_data=rr.data,
+                    webhook_url=url,
+                    session_id=active_session_id,
+                    file_id=file_record.file_id,
+                    source_file_name=fp.name,
+                    source_file_path=str(fp),
+                )
+                if res.inserted:
+                    inserted += 1
+                    file_inserted += 1
+                else:
+                    dup += 1
+                    file_dup += 1
+
+                now = time.time()
+                if now - last_ui > 0.3:
+                    batch_service.update_file_status(
+                        file_id=file_record.file_id,
+                        status=FILE_STATUS_PARSING,
+                        file_type=det.file_type,
+                        parse_rows=file_inserted,
+                        current_stage="parsing",
+                    )
+                    progress(idx, max(total_files, 1), f"解析 {fp.name} 行={file_row_count}")
+                    last_ui = now
+
+            was_stopped = stop_flag()
+            final_status = FILE_STATUS_STOPPED if was_stopped else FILE_STATUS_READY_TO_UPLOAD
+            batch_service.update_file_status(
+                file_id=file_record.file_id,
+                status=final_status,
+                file_type=det.file_type,
+                parse_rows=file_inserted,
+                current_stage="stopped" if was_stopped else "parsed",
+            )
+
+            log(
+                f"文件解析完成: {fp.name} 解析行数={file_row_count} "
+                f"插入={file_inserted} 重复={file_dup} 跳过={file_skipped}"
+            )
+
+            try:
+                if "processed" in fp.parts:
+                    log("已在 processed 目录，跳过归档")
+                elif cfg.archive_to_processed_dir:
+                    dst = archive_file(
+                        fp,
+                        to_processed_dir=cfg.archive_to_processed_dir,
+                        suffix=cfg.archive_suffix,
+                    )
+                    log(f"已归档: {dst}")
+            except Exception as e:
+                log(f"归档失败（不影响流程）: {e}")
+
         except Exception as e:
-            log(f"归档失败（不影响流程）: {e}")
+            session_had_failure = True
+            batch_service.update_file_status(
+                file_id=file_record.file_id,
+                status=FILE_STATUS_PARSE_FAILED,
+                parse_error=str(e),
+                current_stage="parse_failed",
+            )
+            log(f"文件解析失败: {fp.name} error={e}")
+            continue
+
+    summary = batch_service.summary(active_session_id)
+    if stop_flag():
+        batch_service.update_session_status(
+            session_id=active_session_id,
+            status=SESSION_STATUS_STOPPED if not session_had_failure else SESSION_STATUS_PARTIAL_FAILED,
+            last_error="用户停止解析",
+        )
+    elif summary and summary.failed_files > 0:
+        batch_service.update_session_status(
+            session_id=active_session_id,
+            status=SESSION_STATUS_PARTIAL_FAILED,
+            last_error="部分文件解析失败",
+        )
+    elif summary and summary.total_files > 0:
+        batch_service.update_session_status(
+            session_id=active_session_id,
+            status=SESSION_STATUS_PARSED,
+        )
+    else:
+        batch_service.update_session_status(
+            session_id=active_session_id,
+            status=SESSION_STATUS_FAILED,
+            last_error="没有可用文件",
+        )
 
     return ParseStats(
         parsed_rows=parsed,
         inserted_rows=inserted,
         duplicate_rows=dup,
         skipped_rows=skipped,
+        session_id=active_session_id,
     )
 
 
@@ -212,26 +289,6 @@ def run_pipeline(
     progress: Callable[[int, int, str], None],
     stop_flag: Callable[[], bool],
 ) -> RunStats:
-    """
-    端到端处理流程
-    
-    流程：
-    1. 解析选定的文件 -> 插入任务到 SQLite
-    2. 获取待推送任务 -> 分组/批处理 -> 推送到 webhook
-    
-    Args:
-        cfg: 应用配置
-        db_path: 数据库路径
-        file_paths: 要处理的文件路径列表
-        breaker: 熔断器实例
-        log: 日志回调函数
-        progress: 进度回调函数
-        stop_flag: 停止标志检查函数
-        
-    Returns:
-        RunStats 对象，包含运行统计信息
-    """
-    # Parse files
     parse_stats = _parse_files(
         cfg=cfg,
         db_path=db_path,
@@ -241,39 +298,15 @@ def run_pipeline(
         stop_flag=stop_flag,
     )
 
-    # push pending
-    tasks = fetch_pending_tasks(db_path)
-    log(f"待推送任务数(PENDING): {len(tasks)}")
-    batches = list(iter_batches(tasks, batch_size=cfg.batch_size))
-    total_batches = len(batches)
-
-    # Initialize sent_batches to avoid UnboundLocalError if batches is empty
-    sent_batches = 0
-
-    # Preview fastest path: do not iterate thousands of batches; only preview.
-    if cfg.dry_run:
-        log(f"[预演] 预计 batches={total_batches}（每包{cfg.batch_size}条）")
-        for i, b in enumerate(batches[:3], start=1):
-            try:
-                send_batch(cfg=cfg, db_path=db_path, breaker=breaker, batch=b, logger=log)
-            except Exception as e:
-                log(f"[预演] 预览失败: {e}")
-                break
-        sent_batches = 0
-    else:
-        for i, b in enumerate(batches, start=1):
-            if stop_flag():
-                log("已停止：退出推送")
-                break
-            try:
-                send_batch(cfg=cfg, db_path=db_path, breaker=breaker, batch=b, logger=log)
-                sent_batches += 1
-            except CircuitOpenError as e:
-                log(str(e))
-                # stop pushing further batches for now; user can reset
-                break
-            finally:
-                progress(i, max(total_batches, 1), f"推送 batch {i}/{total_batches}")
+    push_stats = push_only(
+        cfg=cfg,
+        db_path=db_path,
+        breaker=breaker,
+        log=log,
+        progress=progress,
+        stop_flag=stop_flag,
+        session_id=parse_stats.session_id,
+    )
 
     log("流程完成")
     progress(1, 1, "完成")
@@ -282,7 +315,8 @@ def run_pipeline(
         inserted_rows=parse_stats.inserted_rows,
         duplicate_rows=parse_stats.duplicate_rows,
         skipped_rows=parse_stats.skipped_rows,
-        sent_batches=sent_batches,
+        sent_batches=push_stats.success_batches,
+        session_id=parse_stats.session_id,
     )
 
 
@@ -294,24 +328,8 @@ def parse_only(
     log: Callable[[str], None],
     progress: Callable[[int, int, str], None],
     stop_flag: Callable[[], bool],
+    session_id: str | None = None,
 ) -> RunStats:
-    """
-    仅解析模式：解析/清洗/去重/入库，不推送
-    
-    该函数只负责将 Excel 文件解析并插入到数据库，不会执行推送操作。
-    推送操作需要单独调用 push_only 函数。
-    
-    Args:
-        cfg: 应用配置
-        db_path: 数据库路径
-        file_paths: 要处理的文件路径列表
-        log: 日志回调函数
-        progress: 进度回调函数
-        stop_flag: 停止标志检查函数
-        
-    Returns:
-        RunStats 对象，包含运行统计信息
-    """
     parse_stats = _parse_files(
         cfg=cfg,
         db_path=db_path,
@@ -319,6 +337,7 @@ def parse_only(
         log=log,
         progress=progress,
         stop_flag=stop_flag,
+        session_id=session_id,
     )
 
     progress(1, 1, "解析完成")
@@ -328,6 +347,7 @@ def parse_only(
         duplicate_rows=parse_stats.duplicate_rows,
         skipped_rows=parse_stats.skipped_rows,
         sent_batches=0,
+        session_id=parse_stats.session_id,
     )
 
 
@@ -340,44 +360,32 @@ def push_only(
     progress: Callable[[int, int, str], None],
     stop_flag: Callable[[], bool],
     file_type_filter: Optional[str] = None,
+    session_id: str | None = None,
 ) -> PushStats:
-    """
-    仅推送模式：从 SQLite 发送 PENDING 状态的任务
-    
-    严格规则：如果某个批次没有获得响应，停止并不再发送下一个批次。
-    
-    该函数会：
-    1. 回填待推送任务的 store_id（升级兼容性）
-    2. 重新排队之前跳过的会员交易明细行（如果它们有 store_id）
-    3. 获取待推送任务并批量推送
-    
-    Args:
-        cfg: 应用配置
-        db_path: 数据库路径
-        breaker: 熔断器实例
-        log: 日志回调函数
-        progress: 进度回调函数
-        stop_flag: 停止标志检查函数
-        file_type_filter: 可选的文件类型过滤，只推送指定类型的任务
-        
-    Returns:
-        PushStats 对象，包含推送统计信息
-    """
     init_db(db_path)
+    batch_service = BatchService(db_path)
 
-    # Backfill store_id for old pending rows (upgrade safety)
-    backfill_pending_store_ids(db_path)
-    # Requeue previously skipped member_trade rows that actually have store_id in raw_data
-    requeue_skipped_member_trade_with_store_id(db_path)
+    if session_id:
+        backfill_pending_store_ids_for_session(db_path, session_id=session_id)
+        requeue_skipped_member_trade_with_store_id_for_session(db_path, session_id=session_id)
+    else:
+        backfill_pending_store_ids(db_path)
+        requeue_skipped_member_trade_with_store_id(db_path)
 
-    tasks = fetch_pending_tasks(db_path, file_type_filter=file_type_filter)
+    if session_id:
+        batch_service.update_session_status(
+            session_id=session_id,
+            status=SESSION_STATUS_UPLOADING,
+            started=True,
+        )
+
+    tasks = fetch_pending_tasks(db_path, file_type_filter=file_type_filter, session_id=session_id)
     pending_rows = len(tasks)
     batches = list(iter_batches(tasks, batch_size=cfg.batch_size))
     total_batches = len(batches)
 
     mode = "preview" if cfg.dry_run else "real"
     last_errors: list[str] = []
-
     attempted = 0
     success_batches = 0
     skipped_batches = 0
@@ -385,7 +393,9 @@ def push_only(
 
     if file_type_filter:
         log(f"[过滤] 仅推送文件类型: {file_type_filter}")
-    
+    if session_id:
+        log(f"[本次上传] session_id={session_id}")
+
     if cfg.dry_run:
         log(f"[预演] 待推送行数={pending_rows}，预计 batches={total_batches}（每包{cfg.batch_size}条）")
         for i, b in enumerate(batches[:3], start=1):
@@ -400,6 +410,8 @@ def push_only(
                 progress(i, max(min(total_batches, 3), 1), f"预览 batch {i}/{min(total_batches, 3)}")
         if not stopped_reason:
             stopped_reason = "预演完成（仅展示前3包）"
+        if session_id:
+            batch_service.update_session_status(session_id=session_id, status=SESSION_STATUS_PARSED)
         progress(1, 1, "预览完成")
         return PushStats(
             mode=mode,
@@ -410,41 +422,111 @@ def push_only(
             skipped_batches=0,
             stopped_reason=stopped_reason,
             last_errors=last_errors,
+            session_id=session_id or "",
         )
 
-    log(f"真实推送开始：待推送行数={pending_rows}，batches={total_batches}" + (f"（仅推送: {file_type_filter}）" if file_type_filter else ""))
+    log(
+        f"真实推送开始：待推送行数={pending_rows}，batches={total_batches}"
+        + (f"（仅推送: {file_type_filter}）" if file_type_filter else "")
+    )
     for i, b in enumerate(batches, start=1):
         if stop_flag():
             stopped_reason = "用户停止"
             break
 
         attempted += 1
+        if b.file_id:
+            batch_service.update_file_status(
+                file_id=b.file_id,
+                status=FILE_STATUS_UPLOADING,
+                current_stage="uploading",
+                upload_error="",
+            )
         try:
             res = send_batch(cfg=cfg, db_path=db_path, breaker=breaker, batch=b, logger=log)
             if res.success:
                 success_batches += 1
+                if b.file_id:
+                    uploaded_rows = batch_service.count_file_tasks(file_id=b.file_id, status="SUCCESS")
+                    batch_service.update_file_status(
+                        file_id=b.file_id,
+                        status=FILE_STATUS_UPLOAD_SUCCESS,
+                        uploaded_rows=uploaded_rows,
+                        current_stage="uploaded",
+                    )
             else:
                 skipped_batches += 1
                 if res.error:
                     last_errors.append(res.error)
+                if b.file_id:
+                    batch_service.update_file_status(
+                        file_id=b.file_id,
+                        status=FILE_STATUS_UPLOAD_FAILED,
+                        upload_error=res.error,
+                        current_stage="upload_failed",
+                    )
         except NoResponseStopError as e:
             stopped_reason = str(e)
             last_errors.append(stopped_reason)
+            if b.file_id:
+                batch_service.update_file_status(
+                    file_id=b.file_id,
+                    status=FILE_STATUS_UPLOAD_FAILED,
+                    upload_error=stopped_reason,
+                    current_stage="upload_failed",
+                )
             break
         except CircuitOpenError as e:
             stopped_reason = str(e)
             last_errors.append(stopped_reason)
+            if b.file_id:
+                batch_service.update_file_status(
+                    file_id=b.file_id,
+                    status=FILE_STATUS_UPLOAD_FAILED,
+                    upload_error=stopped_reason,
+                    current_stage="upload_failed",
+                )
             break
         except Exception as e:
-            # Unknown exception: stop to be safe
             stopped_reason = f"未知异常，已停止后续推送: {e}"
             last_errors.append(stopped_reason)
+            if b.file_id:
+                batch_service.update_file_status(
+                    file_id=b.file_id,
+                    status=FILE_STATUS_UPLOAD_FAILED,
+                    upload_error=stopped_reason,
+                    current_stage="upload_failed",
+                )
             break
         finally:
             progress(i, max(total_batches, 1), f"推送 batch {i}/{total_batches}")
 
     if not stopped_reason:
         stopped_reason = "推送完成"
+
+    if session_id:
+        summary = batch_service.summary(session_id)
+        if stopped_reason == "推送完成" and summary and summary.failed_files == 0:
+            batch_service.update_session_status(
+                session_id=session_id,
+                status=SESSION_STATUS_COMPLETED,
+                finished=True,
+            )
+        elif summary and summary.uploaded_files > 0:
+            batch_service.update_session_status(
+                session_id=session_id,
+                status=SESSION_STATUS_PARTIAL_FAILED,
+                last_error=stopped_reason,
+                finished=True,
+            )
+        else:
+            batch_service.update_session_status(
+                session_id=session_id,
+                status=SESSION_STATUS_FAILED,
+                last_error=stopped_reason,
+                finished=True,
+            )
+
     progress(1, 1, "推送结束")
     return PushStats(
         mode=mode,
@@ -455,6 +537,5 @@ def push_only(
         skipped_batches=skipped_batches,
         stopped_reason=stopped_reason,
         last_errors=last_errors[-20:],
+        session_id=session_id or "",
     )
-
-

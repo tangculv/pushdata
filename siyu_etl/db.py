@@ -6,18 +6,21 @@
 2. 任务（upload_tasks）的增删改查
 3. 任务状态管理（PENDING、SUCCESS、SKIPPED、FAILED）
 4. 数据迁移和兼容性处理（如 store_id 回填）
+5. 批量上传 session / file 级持久化
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from siyu_etl.fingerprint import extract_store_id
+from siyu_etl.excel_detect import FILETYPE_MEMBER_TRADE
 
 
 # 任务状态常量
@@ -26,36 +29,77 @@ STATUS_SUCCESS = "SUCCESS"   # 成功
 STATUS_SKIPPED = "SKIPPED"   # 跳过
 STATUS_FAILED = "FAILED"     # 失败
 
+# 批量任务状态
+SESSION_STATUS_CREATED = "CREATED"
+SESSION_STATUS_PARSING = "PARSING"
+SESSION_STATUS_PARSED = "PARSED"
+SESSION_STATUS_UPLOADING = "UPLOADING"
+SESSION_STATUS_COMPLETED = "COMPLETED"
+SESSION_STATUS_PARTIAL_FAILED = "PARTIAL_FAILED"
+SESSION_STATUS_STOPPED = "STOPPED"
+SESSION_STATUS_FAILED = "FAILED"
+
+# 文件状态
+FILE_STATUS_PENDING_PARSE = "PENDING_PARSE"
+FILE_STATUS_PARSING = "PARSING"
+FILE_STATUS_PARSE_SUCCESS = "PARSE_SUCCESS"
+FILE_STATUS_PARSE_FAILED = "PARSE_FAILED"
+FILE_STATUS_READY_TO_UPLOAD = "READY_TO_UPLOAD"
+FILE_STATUS_UPLOADING = "UPLOADING"
+FILE_STATUS_UPLOAD_SUCCESS = "UPLOAD_SUCCESS"
+FILE_STATUS_UPLOAD_FAILED = "UPLOAD_FAILED"
+FILE_STATUS_STOPPED = "STOPPED"
+
 # 数据库版本管理
-DB_VERSION = 1  # 当前数据库版本
+DB_VERSION = 3  # 当前数据库版本
 
 
 @dataclass(frozen=True)
 class InsertResult:
-    """
-    插入结果数据类
-    
-    Attributes:
-        inserted: 是否成功插入
-        reason: 插入失败的原因（如果失败）
-    """
     inserted: bool
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class BatchSessionRecord:
+    session_id: str
+    mode: str
+    status: str
+    total_files: int
+    parsed_files: int
+    uploaded_files: int
+    failed_files: int
+    total_rows: int
+    uploaded_rows: int
+    last_error: str
+    created_at: str
+    started_at: str
+    finished_at: str
+
+
+@dataclass(frozen=True)
+class BatchFileRecord:
+    file_id: str
+    session_id: str
+    file_path: str
+    file_name: str
+    file_size: int
+    file_mtime: str
+    file_hash: str
+    file_type: str
+    status: str
+    parse_rows: int
+    uploaded_rows: int
+    parse_error: str
+    upload_error: str
+    current_stage: str
+    created_at: str
+    updated_at: str
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
-    """
-    连接到 SQLite 数据库
-    
-    配置了 WAL（Write-Ahead Logging）模式和 NORMAL 同步模式以提高性能。
-    
-    Args:
-        db_path: 数据库文件路径
-        
-    Returns:
-        SQLite 连接对象
-    """
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -63,24 +107,6 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def db_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """
-    数据库连接上下文管理器
-    
-    自动管理数据库连接的打开和关闭，确保连接在使用后正确关闭。
-    
-    Args:
-        db_path: 数据库文件路径
-        
-    Yields:
-        SQLite 连接对象
-        
-    Example:
-        ```python
-        with db_connection(db_path) as conn:
-            conn.execute("SELECT * FROM upload_tasks")
-            conn.commit()
-        ```
-    """
     conn = connect(db_path)
     try:
         yield conn
@@ -89,56 +115,98 @@ def db_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _get_db_version(conn: sqlite3.Connection) -> int:
-    """
-    获取当前数据库版本
-    
-    Args:
-        conn: 数据库连接
-        
-    Returns:
-        数据库版本号，如果版本表不存在则返回 0
-    """
     try:
         result = conn.execute("SELECT version FROM db_version ORDER BY version DESC LIMIT 1;").fetchone()
         return int(result[0]) if result else 0
     except sqlite3.OperationalError:
-        # 版本表不存在，返回 0
         return 0
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table});").fetchall()]
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    if name not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl};")
+
+
 def _migrate_db(conn: sqlite3.Connection, from_version: int, to_version: int) -> None:
-    """
-    执行数据库迁移
-    
-    Args:
-        conn: 数据库连接
-        from_version: 当前版本
-        to_version: 目标版本
-    """
-    # 迁移 0 -> 1: 添加 store_id 列（如果不存在）
     if from_version < 1 <= to_version:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(upload_tasks);").fetchall()]
-        if "store_id" not in cols:
-            conn.execute("ALTER TABLE upload_tasks ADD COLUMN store_id TEXT DEFAULT '';")
-    
-    # 更新版本号
+        _ensure_column(conn, "upload_tasks", "store_id", "store_id TEXT DEFAULT ''")
+
+    if from_version < 2 <= to_version:
+        _ensure_column(conn, "upload_tasks", "session_id", "session_id TEXT DEFAULT ''")
+        _ensure_column(conn, "upload_tasks", "file_id", "file_id TEXT DEFAULT ''")
+        _ensure_column(conn, "upload_tasks", "source_file_name", "source_file_name TEXT DEFAULT ''")
+        _ensure_column(conn, "upload_tasks", "source_file_path", "source_file_path TEXT DEFAULT ''")
+
+        conn.execute(
+            """
+CREATE TABLE IF NOT EXISTS batch_sessions (
+    session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'parse_then_upload',
+    status TEXT NOT NULL DEFAULT 'CREATED',
+    total_files INTEGER NOT NULL DEFAULT 0,
+    parsed_files INTEGER NOT NULL DEFAULT 0,
+    uploaded_files INTEGER NOT NULL DEFAULT 0,
+    failed_files INTEGER NOT NULL DEFAULT 0,
+    total_rows INTEGER NOT NULL DEFAULT 0,
+    uploaded_rows INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP DEFAULT '',
+    finished_at TIMESTAMP DEFAULT ''
+);
+""".strip()
+        )
+        conn.execute(
+            """
+CREATE TABLE IF NOT EXISTS batch_files (
+    file_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    file_mtime TEXT DEFAULT '',
+    file_hash TEXT DEFAULT '',
+    file_type TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING_PARSE',
+    parse_rows INTEGER NOT NULL DEFAULT 0,
+    uploaded_rows INTEGER NOT NULL DEFAULT 0,
+    parse_error TEXT DEFAULT '',
+    upload_error TEXT DEFAULT '',
+    current_stage TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+""".strip()
+        )
+
+    if from_version < 3 <= to_version:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_session_id ON upload_tasks(session_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_file_id ON upload_tasks(file_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_files_session_id ON batch_files(session_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_files_status ON batch_files(status);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_sessions_status ON batch_sessions(status);"
+        )
+
     conn.execute("UPDATE db_version SET version = ?;", (to_version,))
     conn.commit()
 
 
 def init_db(db_path: Path) -> None:
-    """
-    初始化数据库，创建表结构和索引
-    
-    如果表已存在，则只创建缺失的索引。
-    如果数据库是旧版本，会自动执行迁移。
-    
-    Args:
-        db_path: 数据库文件路径
-    """
     db_path = Path(db_path)
     with db_connection(db_path) as conn:
-        # 创建版本管理表
         conn.execute(
             """
 CREATE TABLE IF NOT EXISTS db_version (
@@ -146,12 +214,9 @@ CREATE TABLE IF NOT EXISTS db_version (
 );
 """.strip()
         )
-        
-        # 如果版本表为空，插入初始版本
         if conn.execute("SELECT COUNT(*) FROM db_version;").fetchone()[0] == 0:
             conn.execute("INSERT INTO db_version (version) VALUES (?);", (0,))
-        
-        # 创建主表
+
         conn.execute(
             """
 CREATE TABLE IF NOT EXISTS upload_tasks (
@@ -165,46 +230,43 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     status TEXT DEFAULT 'PENDING',
     webhook_url TEXT,
     error TEXT,
+    session_id TEXT DEFAULT '',
+    file_id TEXT DEFAULT '',
+    source_file_name TEXT DEFAULT '',
+    source_file_path TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """.strip()
         )
-        
-        # 检查并执行迁移
+
         current_version = _get_db_version(conn)
         if current_version < DB_VERSION:
             _migrate_db(conn, current_version, DB_VERSION)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_status ON upload_tasks(status);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_store ON upload_tasks(store_name);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_store_id ON upload_tasks(store_id);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_type ON upload_tasks(file_type);"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_ts ON upload_tasks(timestamp);"
-        )
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_status ON upload_tasks(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_store ON upload_tasks(store_name);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_store_id ON upload_tasks(store_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_type ON upload_tasks(file_type);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_ts ON upload_tasks(timestamp);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_session_id ON upload_tasks(session_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_upload_tasks_file_id ON upload_tasks(file_id);")
         conn.commit()
 
 
 def clear_all_tasks(db_path: Path) -> None:
-    """
-    清空所有任务（用于重置功能）
-    
-    Args:
-        db_path: 数据库文件路径
-    """
     with db_connection(Path(db_path)) as conn:
         conn.execute("DELETE FROM upload_tasks;")
         conn.commit()
 
 
+
+
+def clear_batch_runtime_data(db_path: Path) -> None:
+    with db_connection(Path(db_path)) as conn:
+        conn.execute("DELETE FROM batch_files;")
+        conn.execute("DELETE FROM batch_sessions;")
+        conn.commit()
 def insert_task(
     db_path: Path,
     *,
@@ -215,31 +277,20 @@ def insert_task(
     timestamp: str,
     raw_data: dict[str, Any],
     webhook_url: Optional[str] = None,
+    session_id: str = "",
+    file_id: str = "",
+    source_file_name: str = "",
+    source_file_path: str = "",
 ) -> InsertResult:
-    """
-    插入一个新任务到数据库
-    
-    如果 fingerprint 已存在（重复），则返回插入失败的结果。
-    
-    Args:
-        db_path: 数据库文件路径
-        fingerprint: 行指纹（唯一标识）
-        file_type: 文件类型
-        store_id: 门店 ID
-        store_name: 门店名称
-        timestamp: 时间戳
-        raw_data: 原始数据字典（会被序列化为 JSON）
-        webhook_url: webhook URL（可选）
-        
-    Returns:
-        InsertResult 对象，包含插入结果
-    """
     with db_connection(Path(db_path)) as conn:
         try:
             conn.execute(
                 """
-INSERT INTO upload_tasks (fingerprint, file_type, store_id, store_name, timestamp, raw_data, status, webhook_url)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO upload_tasks (
+    fingerprint, file_type, store_id, store_name, timestamp, raw_data, status, webhook_url,
+    session_id, file_id, source_file_name, source_file_path
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """.strip(),
                 (
                     fingerprint,
@@ -250,6 +301,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                     json.dumps(raw_data, ensure_ascii=False, sort_keys=True),
                     STATUS_PENDING,
                     webhook_url,
+                    session_id,
+                    file_id,
+                    source_file_name,
+                    source_file_path,
                 ),
             )
             conn.commit()
@@ -258,194 +313,358 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             return InsertResult(inserted=False, reason="DUPLICATE_FINGERPRINT")
 
 
-def update_task_status(
-    db_path: Path,
-    *,
-    fingerprint: str,
-    status: str,
-    error: str = "",
-) -> None:
-    """
-    更新单个任务的状态
-    
-    Args:
-        db_path: 数据库文件路径
-        fingerprint: 任务指纹
-        status: 新状态
-        error: 错误信息（可选）
-    """
+def create_batch_session(db_path: Path, *, mode: str = "parse_then_upload", session_id: str | None = None) -> str:
+    init_db(db_path)
+    sid = session_id or uuid.uuid4().hex
     with db_connection(Path(db_path)) as conn:
         conn.execute(
-            """
-UPDATE upload_tasks
-SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
-WHERE fingerprint = ?;
-""".strip(),
-            (status, error, fingerprint),
+            "INSERT INTO batch_sessions (session_id, mode, status) VALUES (?, ?, ?);",
+            (sid, mode, SESSION_STATUS_CREATED),
+        )
+        conn.commit()
+    return sid
+
+
+def update_batch_session_status(
+    db_path: Path,
+    *,
+    session_id: str,
+    status: str,
+    last_error: str = "",
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    fields = ["status = ?", "last_error = ?"]
+    params: list[Any] = [status, last_error]
+    if started:
+        fields.append("started_at = CURRENT_TIMESTAMP")
+    if finished:
+        fields.append("finished_at = CURRENT_TIMESTAMP")
+    params.append(session_id)
+    with db_connection(Path(db_path)) as conn:
+        conn.execute(
+            f"UPDATE batch_sessions SET {', '.join(fields)} WHERE session_id = ?;",
+            tuple(params),
         )
         conn.commit()
 
 
-def update_tasks_status(
+def refresh_batch_session_counters(db_path: Path, *, session_id: str) -> None:
+    with db_connection(Path(db_path)) as conn:
+        row = conn.execute(
+            """
+SELECT
+    COUNT(*) AS total_files,
+    SUM(CASE WHEN status IN ('PARSE_SUCCESS', 'READY_TO_UPLOAD', 'UPLOADING', 'UPLOAD_SUCCESS') THEN 1 ELSE 0 END) AS parsed_files,
+    SUM(CASE WHEN status = 'UPLOAD_SUCCESS' THEN 1 ELSE 0 END) AS uploaded_files,
+    SUM(CASE WHEN status IN ('PARSE_FAILED', 'UPLOAD_FAILED') THEN 1 ELSE 0 END) AS failed_files,
+    COALESCE(SUM(parse_rows), 0) AS total_rows,
+    COALESCE(SUM(uploaded_rows), 0) AS uploaded_rows
+FROM batch_files
+WHERE session_id = ?;
+""".strip(),
+            (session_id,),
+        ).fetchone()
+        conn.execute(
+            """
+UPDATE batch_sessions
+SET total_files = ?, parsed_files = ?, uploaded_files = ?, failed_files = ?, total_rows = ?, uploaded_rows = ?
+WHERE session_id = ?;
+""".strip(),
+            (
+                int(row["total_files"] or 0),
+                int(row["parsed_files"] or 0),
+                int(row["uploaded_files"] or 0),
+                int(row["failed_files"] or 0),
+                int(row["total_rows"] or 0),
+                int(row["uploaded_rows"] or 0),
+                session_id,
+            ),
+        )
+        conn.commit()
+
+
+def create_batch_file(
     db_path: Path,
     *,
-    fingerprints: list[str],
+    session_id: str,
+    file_path: str,
+    file_name: str,
+    file_size: int = 0,
+    file_mtime: str = "",
+    file_hash: str = "",
+    file_type: str = "",
+    status: str = FILE_STATUS_PENDING_PARSE,
+    file_id: str | None = None,
+) -> str:
+    init_db(db_path)
+    fid = file_id or uuid.uuid4().hex
+    with db_connection(Path(db_path)) as conn:
+        conn.execute(
+            """
+INSERT INTO batch_files (
+    file_id, session_id, file_path, file_name, file_size, file_mtime, file_hash, file_type, status
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+""".strip(),
+            (fid, session_id, file_path, file_name, int(file_size), file_mtime, file_hash, file_type, status),
+        )
+        conn.commit()
+    refresh_batch_session_counters(db_path, session_id=session_id)
+    return fid
+
+
+def update_batch_file_status(
+    db_path: Path,
+    *,
+    file_id: str,
     status: str,
-    error: str = "",
+    file_type: str | None = None,
+    parse_rows: int | None = None,
+    uploaded_rows: int | None = None,
+    parse_error: str | None = None,
+    upload_error: str | None = None,
+    current_stage: str | None = None,
 ) -> None:
-    """
-    批量更新多个任务的状态
-    
-    Args:
-        db_path: 数据库文件路径
-        fingerprints: 任务指纹列表
-        status: 新状态
-        error: 错误信息（可选）
-    """
+    sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    params: list[Any] = [status]
+    if file_type is not None:
+        sets.append("file_type = ?")
+        params.append(file_type)
+    if parse_rows is not None:
+        sets.append("parse_rows = ?")
+        params.append(int(parse_rows))
+    if uploaded_rows is not None:
+        sets.append("uploaded_rows = ?")
+        params.append(int(uploaded_rows))
+    if parse_error is not None:
+        sets.append("parse_error = ?")
+        params.append(parse_error)
+    if upload_error is not None:
+        sets.append("upload_error = ?")
+        params.append(upload_error)
+    if current_stage is not None:
+        sets.append("current_stage = ?")
+        params.append(current_stage)
+    params.append(file_id)
+
+    with db_connection(Path(db_path)) as conn:
+        conn.execute(
+            f"UPDATE batch_files SET {', '.join(sets)} WHERE file_id = ?;",
+            tuple(params),
+        )
+        row = conn.execute("SELECT session_id FROM batch_files WHERE file_id = ?;", (file_id,)).fetchone()
+        conn.commit()
+    if row:
+        refresh_batch_session_counters(db_path, session_id=str(row[0]))
+
+
+def list_batch_files(db_path: Path, *, session_id: str) -> list[BatchFileRecord]:
+    with db_connection(Path(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM batch_files WHERE session_id = ? ORDER BY created_at, file_name;",
+            (session_id,),
+        ).fetchall()
+    return [
+        BatchFileRecord(
+            file_id=str(r["file_id"]),
+            session_id=str(r["session_id"]),
+            file_path=str(r["file_path"]),
+            file_name=str(r["file_name"]),
+            file_size=int(r["file_size"] or 0),
+            file_mtime=str(r["file_mtime"] or ""),
+            file_hash=str(r["file_hash"] or ""),
+            file_type=str(r["file_type"] or ""),
+            status=str(r["status"]),
+            parse_rows=int(r["parse_rows"] or 0),
+            uploaded_rows=int(r["uploaded_rows"] or 0),
+            parse_error=str(r["parse_error"] or ""),
+            upload_error=str(r["upload_error"] or ""),
+            current_stage=str(r["current_stage"] or ""),
+            created_at=str(r["created_at"] or ""),
+            updated_at=str(r["updated_at"] or ""),
+        )
+        for r in rows
+    ]
+
+
+def get_batch_session(db_path: Path, *, session_id: str) -> BatchSessionRecord | None:
+    with db_connection(Path(db_path)) as conn:
+        row = conn.execute("SELECT * FROM batch_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+    if not row:
+        return None
+    return BatchSessionRecord(
+        session_id=str(row["session_id"]),
+        mode=str(row["mode"]),
+        status=str(row["status"]),
+        total_files=int(row["total_files"] or 0),
+        parsed_files=int(row["parsed_files"] or 0),
+        uploaded_files=int(row["uploaded_files"] or 0),
+        failed_files=int(row["failed_files"] or 0),
+        total_rows=int(row["total_rows"] or 0),
+        uploaded_rows=int(row["uploaded_rows"] or 0),
+        last_error=str(row["last_error"] or ""),
+        created_at=str(row["created_at"] or ""),
+        started_at=str(row["started_at"] or ""),
+        finished_at=str(row["finished_at"] or ""),
+    )
+
+
+# ===== legacy / existing helpers below =====
+def _load_raw_data(raw_data: str) -> dict[str, Any]:
+    try:
+        return json.loads(raw_data)
+    except Exception:
+        return {}
+
+
+def update_tasks_status(db_path: Path, *, fingerprints: list[str], status: str, error: str = "") -> None:
     if not fingerprints:
         return
+    placeholders = ",".join(["?"] * len(fingerprints))
     with db_connection(Path(db_path)) as conn:
-        qmarks = ",".join(["?"] * len(fingerprints))
         conn.execute(
-            f"""
-UPDATE upload_tasks
-SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
-WHERE fingerprint IN ({qmarks});
-""".strip(),
+            f"UPDATE upload_tasks SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP WHERE fingerprint IN ({placeholders});",
             (status, error, *fingerprints),
         )
         conn.commit()
 
 
-def update_tasks_error(
-    db_path: Path,
-    *,
-    fingerprints: list[str],
-    error: str,
-) -> None:
-    """
-    仅更新任务的错误信息，不改变状态
-    
-    最佳努力：记录错误但不改变状态（用于临时"无响应"情况，
-    我们希望停止发送下一个批次，但保持任务为 PENDING 状态以便稍后重试）。
-    
-    Args:
-        db_path: 数据库文件路径
-        fingerprints: 任务指纹列表
-        error: 错误信息
-    """
+def update_tasks_error(db_path: Path, *, fingerprints: list[str], error: str) -> None:
     if not fingerprints:
         return
+    placeholders = ",".join(["?"] * len(fingerprints))
     with db_connection(Path(db_path)) as conn:
-        qmarks = ",".join(["?"] * len(fingerprints))
         conn.execute(
-            f"""
-UPDATE upload_tasks
-SET error = ?, updated_at = CURRENT_TIMESTAMP
-WHERE fingerprint IN ({qmarks});
-""".strip(),
+            f"UPDATE upload_tasks SET error = ?, updated_at = CURRENT_TIMESTAMP WHERE fingerprint IN ({placeholders});",
             (error, *fingerprints),
         )
         conn.commit()
 
 
+def _backfill_pending_store_ids(conn: sqlite3.Connection, *, session_id: str | None = None) -> int:
+    sql = (
+        "SELECT id, raw_data FROM upload_tasks "
+        "WHERE status = ? AND (store_id IS NULL OR TRIM(store_id) = '' OR store_id = '-')"
+    )
+    params: list[Any] = [STATUS_PENDING]
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    rows = conn.execute(sql + ";", tuple(params)).fetchall()
+
+    updated = 0
+    for row in rows:
+        raw = _load_raw_data(str(row["raw_data"]))
+        file_type = str(raw.get("_file_type") or raw.get("文件类型") or "")
+        if not file_type:
+            file_type = FILETYPE_MEMBER_TRADE if "交易流水号" in raw else ""
+        if not file_type:
+            continue
+        store_id = extract_store_id(file_type, raw)
+        if store_id:
+            conn.execute(
+                "UPDATE upload_tasks SET store_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+                (store_id, row["id"]),
+            )
+            updated += 1
+    conn.commit()
+    return updated
+
+
 def backfill_pending_store_ids(db_path: Path) -> int:
-    """
-    回填待推送任务的 store_id
-    
-    为在支持 store_id 之前插入的现有待推送行回填 store_id。
-    这修复了实际升级场景，其中旧的 PENDING 数据原本只会使用 storeName 推送。
-    
-    Args:
-        db_path: 数据库文件路径
-        
-    Returns:
-        更新的行数
-    """
-    db_path = Path(db_path)
-    with db_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-SELECT fingerprint, file_type, raw_data
-FROM upload_tasks
-WHERE status = 'PENDING' AND (store_id IS NULL OR store_id = '');
-""".strip()
-        )
-        rows = cur.fetchall()
-        updates: list[tuple[str, str]] = []  # (store_id, fingerprint)
-        for fp, ft, raw in rows:
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            file_type = str(ft)
-            store_id = extract_store_id(file_type, data).strip()
-            if store_id:
-                updates.append((store_id, str(fp)))
+    with db_connection(Path(db_path)) as conn:
+        return _backfill_pending_store_ids(conn)
 
-        if not updates:
-            return 0
 
-        conn.executemany(
-            "UPDATE upload_tasks SET store_id = ?, updated_at = CURRENT_TIMESTAMP WHERE fingerprint = ?;",
-            updates,
-        )
-        conn.commit()
+def backfill_pending_store_ids_for_session(db_path: Path, *, session_id: str) -> int:
+    with db_connection(Path(db_path)) as conn:
+        return _backfill_pending_store_ids(conn, session_id=session_id)
 
-        return len(updates)
+
+def _requeue_skipped_member_trade_with_store_id(conn: sqlite3.Connection, *, session_id: str | None = None) -> int:
+    sql = "SELECT id, raw_data FROM upload_tasks WHERE status = ? AND file_type = ?"
+    params: list[Any] = [STATUS_SKIPPED, FILETYPE_MEMBER_TRADE]
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    rows = conn.execute(sql + ";", tuple(params)).fetchall()
+
+    updated = 0
+    for row in rows:
+        raw = _load_raw_data(str(row["raw_data"]))
+        store_id = extract_store_id(FILETYPE_MEMBER_TRADE, raw)
+        if store_id:
+            conn.execute(
+                "UPDATE upload_tasks SET store_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?;",
+                (store_id, STATUS_PENDING, row["id"]),
+            )
+            updated += 1
+    conn.commit()
+    return updated
 
 
 def requeue_skipped_member_trade_with_store_id(db_path: Path) -> int:
-    """
-    重新排队之前跳过的会员交易明细行（如果它们有 store_id）
-    
-    根本原因修复：解决"Excel 中有 1530 行但只上传了 1030 行"的问题。
-    一些行之前仅使用 storeName 推送，失败后被标记为 SKIPPED。
-    在我们添加 storeId 支持后，这些 SKIPPED 行不会被重试（推送只读取 PENDING 状态）。
-    
-    该函数：
-    - 查找 store_id 为空的 SKIPPED 状态的会员交易明细行
-    - 从 raw_data 中提取 store_id（操作门店机构编码/开卡门店机构编码）
-    - 更新 store_id 并将状态重置为 PENDING 以便重试
-    
-    Args:
-        db_path: 数据库文件路径
-        
-    Returns:
-        重新排队的行数
-    """
-    db_path = Path(db_path)
-    with db_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-SELECT fingerprint, raw_data
-FROM upload_tasks
-WHERE file_type = '会员交易明细'
-  AND status = 'SKIPPED'
-  AND (store_id IS NULL OR store_id = '');
-""".strip()
-        )
-        rows = cur.fetchall()
-        updates: list[tuple[str, str]] = []  # (store_id, fingerprint)
-        for fp, raw in rows:
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            store_id = extract_store_id("会员交易明细", data).strip()
-            if store_id:
-                updates.append((store_id, str(fp)))
-
-        if not updates:
-            return 0
-
-        # Reset to PENDING for retry, clear error
-        conn.executemany(
-            "UPDATE upload_tasks SET store_id = ?, status = 'PENDING', error = '', updated_at = CURRENT_TIMESTAMP WHERE fingerprint = ?;",
-            updates,
-        )
-        conn.commit()
-
-        return len(updates)
+    with db_connection(Path(db_path)) as conn:
+        return _requeue_skipped_member_trade_with_store_id(conn)
 
 
+def requeue_skipped_member_trade_with_store_id_for_session(db_path: Path, *, session_id: str) -> int:
+    with db_connection(Path(db_path)) as conn:
+        return _requeue_skipped_member_trade_with_store_id(conn, session_id=session_id)
+
+
+
+def get_batch_file(db_path: Path, *, file_id: str) -> BatchFileRecord | None:
+    with db_connection(Path(db_path)) as conn:
+        row = conn.execute("SELECT * FROM batch_files WHERE file_id = ?;", (file_id,)).fetchone()
+    if not row:
+        return None
+    return BatchFileRecord(
+        file_id=str(row["file_id"]),
+        session_id=str(row["session_id"]),
+        file_path=str(row["file_path"]),
+        file_name=str(row["file_name"]),
+        file_size=int(row["file_size"] or 0),
+        file_mtime=str(row["file_mtime"] or ""),
+        file_hash=str(row["file_hash"] or ""),
+        file_type=str(row["file_type"] or ""),
+        status=str(row["status"]),
+        parse_rows=int(row["parse_rows"] or 0),
+        uploaded_rows=int(row["uploaded_rows"] or 0),
+        parse_error=str(row["parse_error"] or ""),
+        upload_error=str(row["upload_error"] or ""),
+        current_stage=str(row["current_stage"] or ""),
+        created_at=str(row["created_at"] or ""),
+        updated_at=str(row["updated_at"] or ""),
+    )
+
+
+def get_tasks_count_by_file(db_path: Path, *, file_id: str, status: str | None = None) -> int:
+    sql = "SELECT COUNT(*) FROM upload_tasks WHERE file_id = ?"
+    params: list[Any] = [file_id]
+    if status is not None:
+        sql += " AND status = ?"
+        params.append(status)
+    with db_connection(Path(db_path)) as conn:
+        row = conn.execute(sql + ";", tuple(params)).fetchone()
+    return int(row[0] or 0)
+
+
+def count_session_tasks(
+    db_path: Path,
+    *,
+    session_id: str,
+    status: str | None = None,
+    file_id: str | None = None,
+) -> int:
+    sql = "SELECT COUNT(*) FROM upload_tasks WHERE session_id = ?"
+    params: list[Any] = [session_id]
+    if file_id is not None:
+        sql += " AND file_id = ?"
+        params.append(file_id)
+    if status is not None:
+        sql += " AND status = ?"
+        params.append(status)
+    with db_connection(Path(db_path)) as conn:
+        row = conn.execute(sql + ";", tuple(params)).fetchone()
+    return int(row[0] or 0)

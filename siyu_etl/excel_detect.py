@@ -224,7 +224,8 @@ def detect_sheet(file_path: Path, scan_rows: int = 20) -> DetectedSheet:
         # - 数据区是表头行的下一行开始
         # - 对于数据区上方的区域（包括表头行），如果单元格在合并区域内，取合并区域左上角的值
         # - 以指定的表头行作为表头，不进行向上查找和向下合并
-        headers = fill_header_row(ws, header_row_1based, max_col=scan_max_col)
+        next_row_1based = header_row_1based - 1 if spec.file_type == FILETYPE_MEMBER_STORAGE else None
+        headers = fill_header_row(ws, header_row_1based, next_row_1based=next_row_1based, max_col=scan_max_col)
         
         # Remove empty headers but keep alignment
         headers = [h for h in headers if h]
@@ -273,48 +274,43 @@ def get_header_row_for_file_type(file_type: str) -> int:
 
 def split_merged_cells(ws, row_idx: int, col_idx: int) -> Optional[Any]:
     """
-    拆分合并单元格：如果单元格是合并区域的一部分，
-    返回该合并区域左上角单元格的值。
-    
-    Args:
-        ws: openpyxl 工作表对象
-        row_idx: 行索引（1-based，openpyxl 约定）
-        col_idx: 列索引（1-based，openpyxl 约定）
-        
-    Returns:
-        合并区域左上角单元格的值，如果单元格不在合并区域内则返回 None
+    拆分合并单元格：如果单元格是合并区域的一部分，返回合并区域左上角值；
+    若工作表无法提供 merged_cells 信息，则对同一行做一次轻量向左回溯，尽量还原常见横向合并表头。
     """
-    if not hasattr(ws, "merged_cells"):
-        return None
-    
-    merged_ranges = list(ws.merged_cells.ranges)
-    for merged_range in merged_ranges:
-        if (
-            merged_range.min_row <= row_idx <= merged_range.max_row
-            and merged_range.min_col <= col_idx <= merged_range.max_col
-        ):
-            # This cell is part of a merged region, get the top-left value
-            top_left_cell = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
-            return top_left_cell.value
+    cell_value = ws.cell(row=row_idx, column=col_idx).value
+    if hasattr(ws, "merged_cells"):
+        merged_ranges = list(ws.merged_cells.ranges)
+        for merged_range in merged_ranges:
+            if (
+                merged_range.min_row <= row_idx <= merged_range.max_row
+                and merged_range.min_col <= col_idx <= merged_range.max_col
+            ):
+                top_left_cell = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+                return top_left_cell.value
+        return cell_value
+
+    if cell_value is not None:
+        return cell_value
+
+    for left_col in range(col_idx - 1, 0, -1):
+        left_val = ws.cell(row=row_idx, column=left_col).value
+        if left_val is not None:
+            return left_val
     return None
 
 
 def fill_header_row(
-    ws, header_row_1based: int, max_col: int = MAX_SCAN_COLS
+    ws, header_row_1based: int, next_row_1based: int | None = None, max_col: int = MAX_SCAN_COLS
 ) -> list[str]:
     """
-    填充表头行，处理合并单元格
-    
-    重要规则：
-    1. 数据区是表头行的下一行开始
-    2. 对于数据区上方的区域（包括表头行），如果单元格在合并区域内，取合并区域左上角的值
-    3. 以指定的表头行作为表头，不进行向上查找和向下合并
-    
-    处理流程：
-    1. 对于表头行的每个单元格，检查是否在合并区域内
-    2. 如果在合并区域内，使用合并区域左上角的值
-    3. 如果不在合并区域内，使用单元格本身的值
-    4. 不进行向上查找填充空值，不进行向下合并
+    填充表头行，处理合并单元格和双层表头。
+
+    规则：
+    1. 默认读取指定表头行。
+    2. 若提供 next_row_1based，则把下一行视为补充表头：
+       - 主表头为空且子表头有值时，直接采用子表头
+       - 主表头与子表头同时有值时，拼接为一个完整表头
+    3. 保留中间空列位置，仅去掉尾部连续空列。
     
     Args:
         ws: openpyxl 工作表对象
@@ -325,32 +321,33 @@ def fill_header_row(
         表头字符串列表
     """
     header_row = list(ws.iter_rows(min_row=header_row_1based, max_row=header_row_1based, max_col=max_col))[0]
-    header_values: list[Optional[str]] = []
-    
-    # 读取表头行的每个单元格
-    # 对于数据区上方的区域，如果单元格在合并区域内，取合并区域左上角的值
+    header_values: list[str] = []
+
     for col_idx, cell in enumerate(header_row, start=1):
-        # 检查当前单元格是否在合并区域内
-        # 合并区域可能在数据区上方（例如A3-A4合并，A4是表头行）
-        merged_val = split_merged_cells(ws, header_row_1based, col_idx)
-        if merged_val is not None:
-            # 如果在合并区域内，使用合并区域左上角的值
-            header_values.append(str(merged_val).strip())
-        else:
-            # 如果不在合并区域内，使用单元格本身的值
-            val = cell.value
-            if val is not None:
-                header_values.append(str(val).strip())
-            else:
-                # 空值保留为空字符串，不向上查找
-                header_values.append("")
-    
-    # 移除尾部连续的空列（但保留中间的空列，因为数据列可能仍然有值）
+        val = cell.value
+        header_values.append(str(val).strip() if val is not None else "")
+
+    if next_row_1based is not None:
+        next_row = list(ws.iter_rows(min_row=next_row_1based, max_row=next_row_1based, max_col=max_col))[0]
+        max_cols = max(len(header_values), len(next_row))
+        while len(header_values) < max_cols:
+            header_values.append("")
+
+        for col_idx in range(1, max_cols + 1):
+            next_cell = next_row[col_idx - 1] if col_idx - 1 < len(next_row) else None
+            next_val = str(next_cell.value).strip() if next_cell is not None and next_cell.value is not None else ""
+
+            current_val = header_values[col_idx - 1]
+            if not current_val and next_val:
+                header_values[col_idx - 1] = next_val
+            elif current_val and next_val and next_val not in current_val:
+                header_values[col_idx - 1] = f"{current_val}{next_val}"
+
     while header_values and not header_values[-1]:
         header_values.pop()
-    
-    # 返回所有表头，包括空字符串（保留列位置）
+
     return header_values
+
 
 
 def _infer_header_row_0based(ws, header_values: list[str], scan_rows: int, max_col: int) -> int:

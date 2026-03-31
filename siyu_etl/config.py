@@ -42,13 +42,13 @@ class Webhooks:
     in_store_order_detail: str = (
         "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzIyY2ZkMDlkNGFkYTFjOTU2NTc3"
     )
-    # 会员储值消费分析表数据源的 webhook URL（占位符，需要更新为实际 URL）
+    # 会员储值消费分析表数据源的 webhook URL
     member_storage_analysis: str = (
-        "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzI3YWJkMDlkNGFkYTFjOTYzZTIw"  # Placeholder, update when available
+        "https://cs.mlkee.com/api/workflow/hooks2/Njk3OWNhYjZkMDlkNGFkYTFjNTNiMDk5"
     )
-    # 会员卡导出数据源的 webhook URL（占位符，需要更新为实际 URL）
+    # 会员卡导出数据源的 webhook URL
     member_card_export: str = (
-        "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzI3YWJkMDlkNGFkYTFjOTYzZTIw"  # Placeholder, update when available
+        "https://cs.mlkee.com/api/workflow/hooks2/Njk3MzJkY2NkMDlkNGFkYTFjOTczMzg1"
     )
 
 
