@@ -1,8 +1,3 @@
-# Build desktop artifacts for Siyu ETL Client.
-# Artifacts:
-# - siyu-etl-windows.zip
-# - siyu-etl-macos-intel.zip
-
 name: Build Desktop Apps
 
 on:
@@ -13,7 +8,7 @@ on:
 jobs:
   build-windows:
     name: Build Windows
-    runs-on: macos-15-intel
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -25,7 +20,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: powershell
+        shell: pwsh
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --upgrade pip
@@ -33,23 +28,23 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install pyinstaller
 
       - name: Build with PyInstaller
-        shell: powershell
+        shell: pwsh
         run: |
           .\.venv\Scripts\pyinstaller.exe siyu.spec
 
-
       - name: Zip dist
+        shell: pwsh
         run: |
           Compress-Archive -Path dist\SiyuETL -DestinationPath siyu-etl-windows.zip
 
-      - name: Upload artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: siyu-etl-windows
           path: siyu-etl-windows.zip
 
-  build-macos-intel:
-    name: Build macOS Intel
+  build-macos:
+    name: Build macOS
     runs-on: macos-latest
 
     steps:
@@ -61,30 +56,33 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Tkinter support
-        run: |
-          brew update
-          brew install python-tk
-
       - name: Install dependencies
+        shell: bash
         run: |
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
       - name: Build app bundle
+        shell: bash
         run: |
           source .venv/bin/activate
           pyinstaller --noconfirm --windowed --name SiyuETL main.py
 
-      - name: Zip app bundle
+      - name: Show app architecture
+        shell: bash
         run: |
-          ditto -c -k --sequesterRsrc --keepParent dist/SiyuETL.app siyu-etl-macos-intel.zip
+          file dist/SiyuETL.app/Contents/MacOS/SiyuETL || true
 
-      - name: Upload artifact
+      - name: Zip app bundle
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/SiyuETL.app siyu-etl-macos.zip
+
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: siyu-etl-macos-intel
-          path: siyu-etl-macos-intel.zip
+          name: siyu-etl-macos
+          path: siyu-etl-macos.zip
