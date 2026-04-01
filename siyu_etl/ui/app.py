@@ -408,15 +408,15 @@ class App(_AppBase):
         self._refresh_file_tree()
         self._refresh_summary()
 
-    def _find_resumable_session_id(self) -> str:
+    def _find_resumable_session_id(self) -> tuple[str, int]:
         for session in self.batch_service.list_sessions(limit=20):
             pending = self.batch_service.count_session_tasks(session_id=session.session_id, status="PENDING")
             if pending <= 0:
                 continue
             if session.status in {"COMPLETED"}:
                 continue
-            return session.session_id
-        return ""
+            return session.session_id, pending
+        return "", 0
 
     def _load_session_into_ui(self, session_id: str) -> bool:
         files = self.batch_service.list_files(session_id)
@@ -435,27 +435,37 @@ class App(_AppBase):
         return True
 
     def _on_resume_last_upload(self) -> None:
-        if self._worker and self._worker.is_alive():
-            self.bus.log("当前已有任务在运行")
-            return
-        session_id = self._find_resumable_session_id()
-        if not session_id:
-            Messagebox.show_info("当前没有可恢复的未上传任务", "提示", parent=self)
-            return
-        if not self._load_session_into_ui(session_id):
-            Messagebox.show_warning("找到了本地任务，但恢复文件列表失败，请联系技术支持", "提示", parent=self)
-            return
-        pending = self.batch_service.count_session_tasks(session_id=session_id, status="PENDING")
-        self.bus.log(f"已恢复上次任务：{len(self._file_pool)} 个文件，待上传 {pending} 条")
-        if not Messagebox.okcancel(
-            f"已找到上次未上传完成的任务，共 {len(self._file_pool)} 个文件、待上传 {pending} 条，是否现在继续上传？",
-            "恢复上传",
-            parent=self,
-        ):
+        self.bus.log("开始检查是否存在可恢复的未上传任务")
+        try:
+            if self._worker and self._worker.is_alive():
+                self.bus.log("当前已有任务在运行")
+                Messagebox.show_warning("当前已有任务在运行，请稍后再试", "提示", parent=self)
+                return
+            session_id, pending = self._find_resumable_session_id()
+            if not session_id:
+                self.bus.log("未找到可恢复的未上传任务")
+                Messagebox.show_info("当前没有可恢复的未上传任务", "提示", parent=self)
+                return
+            self.bus.log(f"找到可恢复任务：session_id={session_id}，待上传 {pending} 条")
+            if not self._load_session_into_ui(session_id):
+                self.bus.log(f"恢复失败：session_id={session_id} 的文件列表为空或无法读取")
+                Messagebox.show_warning("找到了本地任务，但恢复文件列表失败，请联系技术支持", "提示", parent=self)
+                return
             self._current_phase = "即将上传"
             self._refresh_summary()
-            return
-        self._start_upload_stage(auto_started=False)
+            self.bus.log(f"已恢复上次任务：{len(self._file_pool)} 个文件，待上传 {pending} 条")
+            if not Messagebox.okcancel(
+                f"已找到上次未上传完成的任务，共 {len(self._file_pool)} 个文件、待上传 {pending} 条，是否现在继续上传？",
+                "恢复上传",
+                parent=self,
+            ):
+                self.bus.log("用户取消了恢复上传")
+                return
+            self.bus.log("用户确认恢复上传，开始继续推送")
+            self._start_upload_stage(auto_started=False)
+        except Exception as e:
+            self.bus.log(f"恢复未上传任务失败: {e}")
+            Messagebox.show_error(str(e), "恢复上传失败", parent=self)
 
     def _on_clear_files(self) -> None:
         if not self._file_pool:
