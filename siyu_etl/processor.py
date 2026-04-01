@@ -384,7 +384,7 @@ def push_only(
     batches = list(iter_batches(tasks, batch_size=cfg.batch_size))
     total_batches = len(batches)
 
-    mode = "preview" if cfg.dry_run else "real"
+    mode = "real"
     last_errors: list[str] = []
     attempted = 0
     success_batches = 0
@@ -396,37 +396,8 @@ def push_only(
     if session_id:
         log(f"[本次上传] session_id={session_id}")
 
-    if cfg.dry_run:
-        log(f"[预演] 待推送行数={pending_rows}，预计 batches={total_batches}（每包{cfg.batch_size}条）")
-        for i, b in enumerate(batches[:3], start=1):
-            attempted += 1
-            try:
-                send_batch(cfg=cfg, db_path=db_path, breaker=breaker, batch=b, logger=log)
-            except Exception as e:
-                stopped_reason = f"预演失败: {e}"
-                last_errors.append(str(e))
-                break
-            finally:
-                progress(i, max(min(total_batches, 3), 1), f"预览 batch {i}/{min(total_batches, 3)}")
-        if not stopped_reason:
-            stopped_reason = "预演完成（仅展示前3包）"
-        if session_id:
-            batch_service.update_session_status(session_id=session_id, status=SESSION_STATUS_PARSED)
-        progress(1, 1, "预览完成")
-        return PushStats(
-            mode=mode,
-            pending_rows=pending_rows,
-            total_batches=total_batches,
-            attempted_batches=attempted,
-            success_batches=0,
-            skipped_batches=0,
-            stopped_reason=stopped_reason,
-            last_errors=last_errors,
-            session_id=session_id or "",
-        )
-
     log(
-        f"真实推送开始：待推送行数={pending_rows}，batches={total_batches}"
+        f"推送开始：待推送行数={pending_rows}，batches={total_batches}"
         + (f"（仅推送: {file_type_filter}）" if file_type_filter else "")
     )
     for i, b in enumerate(batches, start=1):

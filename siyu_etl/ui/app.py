@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 import tkinter as tk
 import ttkbootstrap as tb
-from ttkbootstrap.constants import BOTH, BOTTOM, END, LEFT, RIGHT, TOP, X, Y, YES
+from ttkbootstrap.constants import BOTH, BOTTOM, END, HORIZONTAL, LEFT, RIGHT, TOP, VERTICAL, X, Y, YES
 from tkinter import Menu
 from ttkbootstrap.dialogs import Messagebox
 
@@ -17,7 +17,12 @@ from siyu_etl.batch_service import BatchService
 from siyu_etl.circuit_breaker import CircuitBreaker
 from siyu_etl.config import AppConfig
 from siyu_etl.constants import DEFAULT_CIRCUIT_BREAKER_THRESHOLD
-from siyu_etl.db import clear_all_tasks, clear_batch_runtime_data
+from siyu_etl.db import (
+    SESSION_STATUS_COMPLETED,
+    SESSION_STATUS_PARSED,
+    clear_all_tasks,
+    clear_batch_runtime_data,
+)
 from siyu_etl.processor import parse_only, push_only
 from siyu_etl.settings import load_config, save_config
 from siyu_etl.ui.config_dialog import WebhookConfigDialog
@@ -107,8 +112,9 @@ class App(_AppBase):
         self.batch_service = BatchService(self.config_obj.db_path)
         self._file_pool: list[FileQueueItem] = []
         self._selected_row_path: str = ""
-        self._current_phase = "待开始"
+        self._set_phase("待开始")
         self._current_session_id = ""
+        self._phase_started_at: float = time.time()
 
         self.var_status_bar = tb.StringVar(value="请先把这次要处理的 Excel 文件放进来")
         self.var_phase = tb.StringVar(value="当前阶段：还没开始")
@@ -120,13 +126,8 @@ class App(_AppBase):
         self.var_progress_hint = tb.StringVar(value="支持一次选多个文件，也可以后面继续添加")
         self.var_logs_visible = tb.BooleanVar(value=False)
         self.var_platform_key = tb.StringVar(value=str(self.config_obj.platform_key))
-        self.var_push_mode = tk.StringVar(master=self, value=("preview" if bool(self.config_obj.dry_run) else "real"))
+        self.config_obj.dry_run = False
         self.var_archive = tb.BooleanVar(value=bool(self.config_obj.archive_to_processed_dir))
-
-        try:
-            self.var_push_mode.trace_add("write", lambda *_: self._on_change_push_mode())
-        except Exception:
-            pass
 
         self._build_ui()
         self._configure_styles()
@@ -212,8 +213,10 @@ class App(_AppBase):
         self.completion_label.pack(anchor="w", fill=X)
         self.completion_wrap.pack_forget()
 
-        list_box = tb.Frame(root, bootstyle="light")
-        list_box.pack(side=TOP, fill=BOTH, expand=True, pady=(0, 10))
+        self.content_pane = tk.PanedWindow(root, orient=VERTICAL, sashrelief="flat", bd=0, bg="#EEE7DC")
+        self.content_pane.pack(side=TOP, fill=BOTH, expand=True, pady=(0, 10))
+
+        list_box = tb.Frame(self.content_pane, bootstyle="light")
 
         columns = ("file_name", "status", "uploaded_rows", "error")
         self.files_tree = tb.Treeview(list_box, columns=columns, show="headings", height=14, style="Luxury.Treeview")
@@ -238,13 +241,29 @@ class App(_AppBase):
         tree_scroll.pack(side=RIGHT, fill=Y)
         self.files_tree.configure(yscrollcommand=tree_scroll.set)
         register_drop_target(self.files_tree, on_files=self._on_files_dropped, on_error=lambda m: self.bus.log(m))
+        self.content_pane.add(list_box, stretch="always")
 
-        self.logs_frame = tb.Frame(root, bootstyle="light")
-        self.logs_frame.pack(side=TOP, fill=X, pady=(0, 8))
-        self.log_text = tb.Text(self.logs_frame, height=6, wrap="word", relief="flat", bd=0, background="#FCFBF8", foreground=self.COLOR_TEXT_SECONDARY, insertbackground=self.COLOR_TEXT_PRIMARY)
-        self.log_text.pack(fill=X)
-        self.log_text.configure(state="disabled")
-        self.logs_frame.pack_forget()
+        self.logs_frame = tb.Frame(self.content_pane, bootstyle="light")
+        log_wrap = tb.Frame(self.logs_frame, bootstyle="light")
+        log_wrap.pack(fill=BOTH, expand=True)
+        self.log_text = tb.Text(
+            log_wrap,
+            height=10,
+            wrap="none",
+            relief="flat",
+            bd=0,
+            background="#FCFBF8",
+            foreground=self.COLOR_TEXT_SECONDARY,
+            insertbackground=self.COLOR_TEXT_PRIMARY,
+        )
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        self.log_scroll_y = tb.Scrollbar(log_wrap, orient=VERTICAL, command=self.log_text.yview, bootstyle="round")
+        self.log_scroll_y.pack(side=RIGHT, fill=Y)
+        self.log_scroll_x = tb.Scrollbar(self.logs_frame, orient=HORIZONTAL, command=self.log_text.xview, bootstyle="round")
+        self.log_scroll_x.pack(side=BOTTOM, fill=X)
+        self.log_text.configure(state="disabled", yscrollcommand=self.log_scroll_y.set, xscrollcommand=self.log_scroll_x.set)
+
+        self.logs_frame_visible = False
 
         footer = tb.Frame(root, bootstyle="light")
         footer.pack(side=BOTTOM, fill=X, pady=(4, 0))
@@ -282,18 +301,25 @@ class App(_AppBase):
     def _toggle_logs(self) -> None:
         visible = bool(self.var_logs_visible.get())
         if visible:
-            self.logs_frame.pack_forget()
+            if self.logs_frame_visible:
+                try:
+                    self.content_pane.forget(self.logs_frame)
+                except Exception:
+                    pass
+                self.logs_frame_visible = False
             self.var_logs_visible.set(False)
             self.btn_toggle_logs.configure(text="查看详细过程")
         else:
-            self.logs_frame.pack(side=TOP, fill=X, pady=(0, 8), before=self.footer)
+            if not self.logs_frame_visible:
+                self.content_pane.add(self.logs_frame, stretch="never")
+                try:
+                    self.content_pane.sash_place(0, 0, max(self.winfo_height() - 260, 420))
+                except Exception:
+                    pass
+                self.logs_frame_visible = True
             self.var_logs_visible.set(True)
             self.btn_toggle_logs.configure(text="收起详细过程")
 
-
-    def _on_change_push_mode(self) -> None:
-        self.config_obj.dry_run = str(self.var_push_mode.get()) != "real"
-        self._auto_save_config()
 
     def _on_toggle_archive(self) -> None:
         self.config_obj.archive_to_processed_dir = bool(self.var_archive.get())
@@ -329,7 +355,7 @@ class App(_AppBase):
 
     def _sync_config_from_ui(self) -> None:
         self.config_obj.platform_key = str(self.var_platform_key.get()).strip()
-        self.config_obj.dry_run = str(self.var_push_mode.get()) != "real"
+        self.config_obj.dry_run = False
         self.config_obj.archive_to_processed_dir = bool(self.var_archive.get())
 
     def _ask_excel_files(self) -> list[Path]:
@@ -359,7 +385,7 @@ class App(_AppBase):
     def _replace_file_pool(self, files: list[Path]) -> None:
         self._file_pool = []
         self._current_session_id = ""
-        self._current_phase = "待开始"
+        self._set_phase("待开始")
         self._append_files(files, replacing=True)
 
     def _append_files(self, files: list[Path], replacing: bool = False) -> None:
@@ -369,10 +395,30 @@ class App(_AppBase):
                 self.bus.log("本次没有可用的 .xlsx 文件")
             return
 
+        usable_files: list[Path] = []
+        blocked_processed = 0
+        for fp in xlsx_files:
+            lower_name = fp.name.lower()
+            lower_parts = [part.lower() for part in fp.parts]
+            if "_processed" in lower_name or "processed" in lower_parts:
+                blocked_processed += 1
+                self.bus.log(f"已拦截疑似已处理文件: {fp.name}")
+                continue
+            usable_files.append(fp)
+
+        if blocked_processed:
+            Messagebox.show_warning(
+                f"已拦截 {blocked_processed} 个 processed 文件，请使用原始导出的 Excel 文件。",
+                "文件已拦截",
+                parent=self,
+            )
+        if not usable_files:
+            return
+
         existing = {str(item.path.resolve()) for item in self._file_pool}
         added = 0
         duplicate = 0
-        for fp in xlsx_files:
+        for fp in usable_files:
             key = str(fp.resolve())
             if key in existing:
                 duplicate += 1
@@ -409,14 +455,21 @@ class App(_AppBase):
         self._refresh_summary()
 
     def _find_resumable_session_id(self) -> tuple[str, int]:
+        best_session_id = ""
+        best_pending = 0
+        best_file_count = -1
         for session in self.batch_service.list_sessions(limit=20):
             pending = self.batch_service.count_session_tasks(session_id=session.session_id, status="PENDING")
             if pending <= 0:
                 continue
-            if session.status in {"COMPLETED"}:
+            if session.status in {SESSION_STATUS_COMPLETED}:
                 continue
-            return session.session_id, pending
-        return "", 0
+            file_count = int(session.total_files or 0)
+            if pending > best_pending or (pending == best_pending and file_count > best_file_count):
+                best_session_id = session.session_id
+                best_pending = pending
+                best_file_count = file_count
+        return best_session_id, best_pending
 
     def _load_session_into_ui(self, session_id: str) -> bool:
         files = self.batch_service.list_files(session_id)
@@ -451,11 +504,16 @@ class App(_AppBase):
                 self.bus.log(f"恢复失败：session_id={session_id} 的文件列表为空或无法读取")
                 Messagebox.show_warning("找到了本地任务，但恢复文件列表失败，请联系技术支持", "提示", parent=self)
                 return
-            self._current_phase = "即将上传"
+            self._set_phase("正在准备推送")
             self._refresh_summary()
             self.bus.log(f"已恢复上次任务：{len(self._file_pool)} 个文件，待上传 {pending} 条")
+            restore_message = (
+                f"已找到可恢复任务：{len(self._file_pool)} 个文件，待上传 {pending} 条。\n"
+                "继续后将直接开始推送。\n"
+                "是否现在继续？"
+            )
             if not Messagebox.okcancel(
-                f"已找到上次未上传完成的任务，共 {len(self._file_pool)} 个文件、待上传 {pending} 条，是否现在继续上传？",
+                restore_message,
                 "恢复上传",
                 parent=self,
             ):
@@ -474,7 +532,7 @@ class App(_AppBase):
             return
         self._file_pool = []
         self._current_session_id = ""
-        self._current_phase = "待开始"
+        self._set_phase("待开始")
         self.bus.log("已清空本次文件")
         self._refresh_file_tree()
         self._refresh_summary()
@@ -507,9 +565,9 @@ class App(_AppBase):
     def _ui_status(raw_status: str) -> str:
         mapping = {
             "PENDING_PARSE": "等待处理",
-            "PARSING": "检查中",
-            "PARSE_SUCCESS": "即将上传",
-            "READY_TO_UPLOAD": "即将上传",
+            "PARSING": "处理中",
+            "PARSE_SUCCESS": "待推送",
+            "READY_TO_UPLOAD": "待推送",
             "UPLOADING": "上传中",
             "UPLOAD_SUCCESS": "上传完成",
             "PARSE_FAILED": "检查失败",
@@ -541,19 +599,34 @@ class App(_AppBase):
         if summary:
             status_map = {
                 "CREATED": "待开始",
-                "PARSING": "检查中",
-                "PARSED": "即将上传",
+                "PARSING": "处理中",
+                SESSION_STATUS_PARSED: "正在准备推送",
                 "UPLOADING": "上传中",
                 "COMPLETED": "已完成",
                 "PARTIAL_FAILED": "已完成",
                 "FAILED": "已完成",
                 "STOPPED": "已停止",
             }
-            self._current_phase = status_map.get(summary.status, self._current_phase)
-            if self._current_phase == "即将上传" and any(item.status == "上传中" for item in self._file_pool):
-                self._current_phase = "上传中"
+            next_phase = status_map.get(summary.status, self._current_phase)
+            if next_phase != self._current_phase:
+                self._set_phase(next_phase)
+            if self._current_phase == "待推送" and any(item.status == "上传中" for item in self._file_pool):
+                self._set_phase("上传中")
         self._refresh_file_tree()
         self._refresh_summary()
+
+    def _set_phase(self, phase: str) -> None:
+        if self._current_phase != phase:
+            self._current_phase = phase
+            self._phase_started_at = time.time()
+
+    def _phase_elapsed_text(self) -> str:
+        elapsed = max(0, int(time.time() - self._phase_started_at))
+        minutes, seconds = divmod(elapsed, 60)
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _refresh_summary(self) -> None:
         total_files = len(self._file_pool)
@@ -599,10 +672,10 @@ class App(_AppBase):
             self.var_progress_hint.set("系统会自动检查并上传；如果文件还没加全，可以继续添加")
             self.progress_label.configure(text="等待开始")
             self._set_process_button_text("开始处理")
-        elif self._current_phase == "检查中":
-            self.var_status_bar.set(f"正在检查文件，请稍候（共 {total_files} 个）")
+        elif self._current_phase == "处理中":
+            self.var_status_bar.set(f"正在处理文件，请稍候（共 {total_files} 个）")
             self.var_progress_hint.set("文件较大时会比较久，请保持窗口开启")
-            self._set_process_button_text("检查中...")
+            self._set_process_button_text("处理中...")
         elif self._current_phase == "已停止":
             self.var_status_bar.set("本次操作已停止，可继续调整文件后重新开始")
             self.var_progress_hint.set("已完成的结果会保留，未完成的文件可以重新检查或重新上传")
@@ -610,10 +683,11 @@ class App(_AppBase):
             self.completion_label.configure(style="CompletionMuted.TLabel")
             self.completion_wrap.pack(fill=X, pady=(0, 10), before=self.files_tree.master)
             self._set_process_button_text("重新处理")
-        elif self._current_phase == "即将上传":
-            self.var_status_bar.set("文件检查完成，马上开始上传")
-            self.var_progress_hint.set("不用再操作，系统会自动继续")
-            self._set_process_button_text("准备上传...")
+        elif self._current_phase == "正在准备推送":
+            elapsed_text = self._phase_elapsed_text()
+            self.var_status_bar.set(f"文件处理完成，系统正在准备推送（已持续 {elapsed_text}）")
+            self.var_progress_hint.set(f"本次已处理 {total_parsed} 条，请保持窗口开启；若此状态持续过久可查看日志排查")
+            self._set_process_button_text("准备推送...")
         elif self._current_phase == "上传中":
             self.var_status_bar.set(f"正在上传文件，请稍候（共 {total_files} 个）")
             self.var_progress_hint.set("上传过程中请不要关闭窗口")
@@ -634,7 +708,7 @@ class App(_AppBase):
         if not self._file_pool:
             Messagebox.show_warning("请先选择至少一个 Excel 文件", "提示", parent=self)
             return
-        if not Messagebox.okcancel("系统会自动先检查，再继续上传。确认开始处理吗？", "开始处理", parent=self):
+        if not Messagebox.okcancel("系统会先处理文件，再自动推送。确认开始处理吗？", "开始处理", parent=self):
             return
 
         self._start_parse_stage()
@@ -642,7 +716,7 @@ class App(_AppBase):
     def _start_parse_stage(self) -> None:
         self._sync_config_from_ui()
         self._stop_event.clear()
-        self._current_phase = "检查中"
+        self._set_phase("处理中")
         self._current_session_id = ""
         for item in self._file_pool:
             item.status = "等待检查"
@@ -676,15 +750,15 @@ class App(_AppBase):
             )
             self._current_session_id = stats.session_id
             self._refresh_from_session()
-            self._current_phase = "即将上传"
+            self._set_phase("正在准备推送")
             self._refresh_summary()
-            self.bus.log("文件检查完成，开始继续上传")
+            self.bus.log(f"文件处理完成：本次共处理 {stats.processed_files} 个文件，解析 {stats.parsed_rows} 条，开始继续推送")
             # 解析线程结束后再切换到上传线程，否则会被“当前已有任务在运行”误拦截
             self._worker = None
             self.after(0, lambda: self._start_upload_stage(auto_started=True))
             return
         except Exception as e:
-            self._current_phase = "已完成"
+            self._set_phase("已完成")
             self.progress_label.configure(text="处理未完成")
             self.bus.log(f"文件检查失败: {e}")
         finally:
@@ -703,12 +777,12 @@ class App(_AppBase):
 
         self._sync_config_from_ui()
         self._stop_event.clear()
-        self._current_phase = "上传中"
+        self._set_phase("上传中")
         self._refresh_summary()
         if auto_started:
-            self.bus.log("检查通过，系统已自动继续上传")
+            self.bus.log("处理完成，系统已自动继续推送")
         else:
-            self.bus.log("开始上传本次文件")
+            self.bus.log("开始推送本次文件")
         self._worker = threading.Thread(target=self._worker_upload_run, daemon=True)
         self._worker.start()
 
@@ -724,11 +798,11 @@ class App(_AppBase):
                 session_id=self._current_session_id or None,
             )
             self._refresh_from_session()
-            self.bus.log("上传阶段完成")
+            self.bus.log("推送阶段完成")
             self.progress_bar.configure(value=100)
-            self.progress_label.configure(text="本次处理完成")
+            self.progress_label.configure(text="本次处理与推送已完成")
         except Exception as e:
-            self._current_phase = "已完成"
+            self._set_phase("已完成")
             self.progress_label.configure(text="处理未完成")
             self.bus.log(f"上传失败: {e}")
         finally:
@@ -739,7 +813,7 @@ class App(_AppBase):
             self.bus.log("当前没有运行中的任务")
             return
         self._stop_event.set()
-        self._current_phase = "已停止"
+        self._set_phase("已停止")
         self.progress_label.configure(text="正在停止，请稍候")
         self.bus.log("已请求停止当前操作")
 
@@ -751,7 +825,7 @@ class App(_AppBase):
             clear_batch_runtime_data(self.config_obj.db_path)
             self.breaker.reset()
             self._current_session_id = ""
-            self._current_phase = "待开始"
+            self._set_phase("待开始")
             for item in self._file_pool:
                 item.status = "等待处理"
                 item.file_type = "待识别"
@@ -769,8 +843,13 @@ class App(_AppBase):
     def _tick(self) -> None:
         for line in self.bus.drain_logs():
             self.log_text.configure(state="normal")
+            try:
+                _, bottom = self.log_text.yview()
+            except Exception:
+                bottom = 1.0
             self.log_text.insert(END, line + "\n")
-            self.log_text.see(END)
+            if bottom >= 0.999:
+                self.log_text.see(END)
             self.log_text.configure(state="disabled")
 
         snaps = self.bus.drain_progress()
@@ -780,8 +859,8 @@ class App(_AppBase):
             self.progress_bar.configure(value=pct)
             label = snap.message or f"{snap.current}/{snap.total}"
             self.progress_label.configure(text=label)
-            if self._current_phase == "检查中":
-                self.var_status_bar.set(f"正在检查第 {snap.current}/{max(snap.total, 1)} 个文件")
+            if self._current_phase == "处理中":
+                self.var_status_bar.set(f"正在处理第 {snap.current}/{max(snap.total, 1)} 个文件")
                 self.var_progress_hint.set("文件较大时会比较久，请保持窗口开启")
             elif self._current_phase == "上传中":
                 self.var_status_bar.set(f"正在上传第 {snap.current}/{max(snap.total, 1)} 个文件")
@@ -824,7 +903,7 @@ class App(_AppBase):
 
     def _show_help(self) -> None:
         Messagebox.show_info(
-            "使用步骤：\n1. 先把这次要处理的 Excel 文件加进来\n2. 如果没加全，可以继续添加，系统会自动去重\n3. 点击【开始处理】\n4. 系统会自动先检查，再继续上传\n\n提示：文件较大时请耐心等待，处理中尽量不要关闭窗口。",
+            "使用步骤：\n1. 先把这次要处理的 Excel 文件加进来\n2. 如果没加全，可以继续添加，系统会自动去重\n3. 点击【开始处理】\n4. 系统会自动先处理，再继续上传\n\n提示：文件较大时请耐心等待，处理中尽量不要关闭窗口。",
             "使用帮助",
             parent=self,
         )
