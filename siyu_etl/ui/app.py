@@ -619,7 +619,9 @@ class App(_AppBase):
             self._current_phase = "即将上传"
             self._refresh_summary()
             self.bus.log("文件检查完成，开始继续上传")
-            self._start_upload_stage(auto_started=True)
+            # 解析线程结束后再切换到上传线程，否则会被“当前已有任务在运行”误拦截
+            self._worker = None
+            self.after(0, lambda: self._start_upload_stage(auto_started=True))
             return
         except Exception as e:
             self._current_phase = "已完成"
