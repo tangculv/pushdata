@@ -124,6 +124,7 @@ class App(_AppBase):
         self.var_summary_uploaded = tb.StringVar(value="已上传：0")
         self.var_completion_note = tb.StringVar(value="")
         self.var_progress_hint = tb.StringVar(value="支持一次选多个文件，也可以后面继续添加")
+        self.var_elapsed = tb.StringVar(value="")
         self.var_logs_visible = tb.BooleanVar(value=False)
         self.var_platform_key = tb.StringVar(value=str(self.config_obj.platform_key))
         self.config_obj.dry_run = False
@@ -198,6 +199,8 @@ class App(_AppBase):
         tb.Label(summary_left, textvariable=self.var_summary_success, foreground=self.COLOR_TEXT_SECONDARY).pack(side=LEFT)
         tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
         tb.Label(summary_left, textvariable=self.var_summary_failed, foreground=self.COLOR_TEXT_SECONDARY).pack(side=LEFT)
+        tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
+        tb.Label(summary_left, textvariable=self.var_elapsed, foreground=self.COLOR_GOLD).pack(side=LEFT)
         self.btn_clear_selected = tb.Button(summary_row, text="移除选中", command=self._on_remove_selected, bootstyle="link")
         self.btn_clear_selected.pack(side=RIGHT)
 
@@ -643,6 +646,11 @@ class App(_AppBase):
         self.var_summary_success.set(f"成功：{success_files}")
         self.var_summary_failed.set(f"失败：{failed_files}")
         self.var_summary_uploaded.set(f"已上传：{total_uploaded}")
+        elapsed_text = self._phase_elapsed_text()
+        if self._current_phase in {"处理中", "正在准备推送", "上传中"}:
+            self.var_elapsed.set(f"已持续：{elapsed_text}")
+        else:
+            self.var_elapsed.set("")
         self.var_completion_note.set("")
         try:
             self.completion_label.configure(style="CompletionSuccess.TLabel")
@@ -669,7 +677,7 @@ class App(_AppBase):
             self._set_process_button_text("开始处理")
         elif self._current_phase == "待开始":
             self.var_status_bar.set(f"已经放入 {total_files} 个文件，确认后点一次开始就行")
-            self.var_progress_hint.set("系统会自动检查并上传；如果文件还没加全，可以继续添加")
+            self.var_progress_hint.set("系统会自动处理并上传；如果文件还没加全，可以继续添加")
             self.progress_label.configure(text="等待开始")
             self._set_process_button_text("开始处理")
         elif self._current_phase == "处理中":
@@ -728,7 +736,7 @@ class App(_AppBase):
         self._refresh_file_tree()
         self._refresh_summary()
         self.progress_bar.configure(value=0)
-        self.progress_label.configure(text="正在准备处理")
+        self.progress_label.configure(text=f"正在处理文件 0/{len(self._file_pool)}")
         self.bus.log(f"开始处理，本次共 {len(self._file_pool)} 个文件")
         self._worker = threading.Thread(target=self._worker_parse_run, daemon=True)
         self._worker.start()
@@ -752,7 +760,8 @@ class App(_AppBase):
             self._refresh_from_session()
             self._set_phase("正在准备推送")
             self._refresh_summary()
-            self.bus.log(f"文件处理完成：本次共处理 {stats.processed_files} 个文件，解析 {stats.parsed_rows} 条，开始继续推送")
+            processed_files = len(files)
+            self.bus.log(f"文件处理完成：本次共处理 {processed_files} 个文件，解析 {stats.parsed_rows} 条，开始继续推送")
             # 解析线程结束后再切换到上传线程，否则会被“当前已有任务在运行”误拦截
             self._worker = None
             self.after(0, lambda: self._start_upload_stage(auto_started=True))
@@ -801,6 +810,7 @@ class App(_AppBase):
             self.bus.log("推送阶段完成")
             self.progress_bar.configure(value=100)
             self.progress_label.configure(text="本次处理与推送已完成")
+            self.var_status_bar.set("本次处理与推送已完成")
         except Exception as e:
             self._set_phase("已完成")
             self.progress_label.configure(text="处理未完成")
