@@ -172,10 +172,9 @@ def _parse_files(
                     continue
 
                 insert_seq += 1
-                fingerprint_unique = f"{ident.fingerprint}#{insert_seq}"
                 res = insert_task(
                     db_path,
-                    fingerprint=fingerprint_unique,
+                    fingerprint=ident.fingerprint,
                     file_type=det.file_type,
                     store_id=ident.store_id,
                     store_name=ident.store_name,

@@ -163,7 +163,6 @@ def send_batch(
     处理逻辑：
     - 成功时：将所有项目标记为 SUCCESS，重置失败计数器
     - 最终失败时：将所有项目标记为 SKIPPED，增加失败计数器，可能打开熔断器
-    - dry_run=True：不发送 HTTP 请求，不更新数据库状态（仅记录日志）
     
     Args:
         cfg: 应用配置
@@ -230,13 +229,12 @@ def send_batch(
     # 打印推送地址和参数详情（用于排查）
     if logger:
         import json
-        mode_prefix = "[预演] " if cfg.dry_run else ""
         logger(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        logger(f"{mode_prefix}推送地址: {url}")
-        logger(f"{mode_prefix}文件类型: {batch.file_type}")
-        logger(f"{mode_prefix}门店名称: {batch.store_name}")
-        logger(f"{mode_prefix}数据条数: {len(batch.items)}")
-        logger(f"{mode_prefix}参数详情:")
+        logger(f"推送地址: {url}")
+        logger(f"文件类型: {batch.file_type}")
+        logger(f"门店名称: {batch.store_name}")
+        logger(f"数据条数: {len(batch.items)}")
+        logger(f"参数详情:")
         logger(f"  - platformKey: {cfg.platform_key}")
         if batch.file_type == FILETYPE_MEMBER_CARD_EXPORT:
             logger(f"  - level: {payload.get('level', '')}")
@@ -248,7 +246,7 @@ def send_batch(
         if payload.get('data'):
             logger(f"  - 前3条 fingerprint: {[item.get('fingerprint', '')[:16] + '...' for item in payload['data'][:3]]}")
         # 打印完整的 JSON payload（用于调试）
-        logger(f"{mode_prefix}完整 JSON payload:")
+        logger(f"完整 JSON payload:")
         try:
             payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
             # 如果 JSON 太长，只显示前 2000 个字符
@@ -261,8 +259,6 @@ def send_batch(
             logger(f"  JSON 序列化失败: {e}")
         logger(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    if cfg.dry_run:
-        return UploadResult(success=True, status_code=None, error="")
 
     backoffs = RETRY_BACKOFFS
     last: UploadResult = UploadResult(success=False, status_code=None, error="UNKNOWN")

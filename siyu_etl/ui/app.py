@@ -53,6 +53,7 @@ class UiBus:
     def __init__(self) -> None:
         self._log_q: "queue.Queue[str]" = queue.Queue()
         self._progress_q: "queue.Queue[ProgressSnapshot]" = queue.Queue()
+        self._event_q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -60,6 +61,9 @@ class UiBus:
 
     def progress(self, current: int, total: int, message: str = "") -> None:
         self._progress_q.put(ProgressSnapshot(current=current, total=total, message=message))
+
+    def event(self, kind: str, **payload) -> None:
+        self._event_q.put((kind, payload))
 
     def drain_logs(self, limit: int = 200) -> list[str]:
         out: list[str] = []
@@ -79,6 +83,15 @@ class UiBus:
                 break
         return out
 
+    def drain_events(self, limit: int = 100) -> list[tuple[str, dict]]:
+        out: list[tuple[str, dict]] = []
+        for _ in range(limit):
+            try:
+                out.append(self._event_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
 
 _dnd_tk_class = create_dnd_window_or_none()
 _AppBase = _dnd_tk_class if _dnd_tk_class is not None else tb.Window
@@ -89,7 +102,12 @@ class App(_AppBase):
     COLOR_TEXT_SECONDARY = "#475569"
     COLOR_TEXT_MUTED = "#94A3B8"
     COLOR_ACCENT = "#1E3A5F"
+    COLOR_ACCENT_SOFT = "#E8EEF6"
+    COLOR_SUCCESS = "#0F766E"
+    COLOR_WARNING = "#A16207"
+    COLOR_DANGER = "#B91C1C"
     COLOR_GOLD = "#B6925B"
+    COLOR_BORDER = "#E5E7EB"
     COLOR_SURFACE = "#F8F5EF"
 
     def __init__(self, config: Optional[AppConfig] = None) -> None:
@@ -102,17 +120,19 @@ class App(_AppBase):
             super().__init__(themename="litera")
             self.title("私域营销数据传输工具")
 
-        self.geometry("1120x860")
+        self.geometry("1280x920")
+        self.minsize(1180, 820)
         self.resizable(True, True)
 
         self.bus = UiBus()
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._upload_totals: tuple[int, int] = (0, 0)
         self.breaker = CircuitBreaker(threshold=DEFAULT_CIRCUIT_BREAKER_THRESHOLD)
         self.batch_service = BatchService(self.config_obj.db_path)
         self._file_pool: list[FileQueueItem] = []
         self._selected_row_path: str = ""
-        self._set_phase("待开始")
+        self._current_phase = "待开始"
         self._current_session_id = ""
         self._phase_started_at: float = time.time()
 
@@ -121,10 +141,10 @@ class App(_AppBase):
         self.var_summary_files = tb.StringVar(value="文件：0")
         self.var_summary_success = tb.StringVar(value="成功：0")
         self.var_summary_failed = tb.StringVar(value="失败：0")
-        self.var_summary_uploaded = tb.StringVar(value="已上传：0")
+        self.var_summary_uploaded = tb.StringVar(value="已处理：0｜已上传：0")
         self.var_completion_note = tb.StringVar(value="")
         self.var_progress_hint = tb.StringVar(value="支持一次选多个文件，也可以后面继续添加")
-        self.var_step_hint = tb.StringVar(value="当前步骤：第 1 步（处理文件）｜第 2 步（上传数据）")
+        self.var_step_hint = tb.StringVar(value="当前步骤：等待开始")
         self.var_elapsed = tb.StringVar(value="")
         self.var_logs_visible = tb.BooleanVar(value=False)
         self.var_platform_key = tb.StringVar(value=str(self.config_obj.platform_key))
@@ -144,6 +164,13 @@ class App(_AppBase):
             self.bus.log("当前环境不支持拖拽，请使用“选择文件”按钮")
             self.bus.log(dnd.reason)
 
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+
     def _configure_styles(self) -> None:
         try:
             style = self.style if hasattr(self, "style") else tb.Style()
@@ -160,83 +187,109 @@ class App(_AppBase):
                             font=("Helvetica", 11, "bold"))
             style.map("Luxury.Treeview", background=[("selected", "#E9E2D5")], foreground=[("selected", self.COLOR_TEXT_PRIMARY)])
             style.configure("Completion.TLabel", background="#F4EFE6", foreground=self.COLOR_GOLD, padding=12, font=("Helvetica", 11, "bold"))
-            style.configure("CompletionSuccess.TLabel", background="#F4EFE6", foreground=self.COLOR_GOLD, padding=12, font=("Helvetica", 11, "bold"))
-            style.configure("CompletionWarning.TLabel", background="#F7F1E8", foreground="#A16207", padding=12, font=("Helvetica", 11, "bold"))
+            style.configure("CompletionSuccess.TLabel", background="#ECFDF5", foreground=self.COLOR_SUCCESS, padding=12, font=("Helvetica", 11, "bold"))
+            style.configure("CompletionWarning.TLabel", background="#FFFBEB", foreground=self.COLOR_WARNING, padding=12, font=("Helvetica", 11, "bold"))
             style.configure("CompletionMuted.TLabel", background="#F3F4F6", foreground=self.COLOR_TEXT_SECONDARY, padding=12, font=("Helvetica", 11, "bold"))
-            style.configure("HeaderCaption.TLabel", background="#FFFFFF", foreground=self.COLOR_GOLD, font=("Helvetica", 10))
-            style.configure("HeaderTitle.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_PRIMARY, font=("Helvetica", 22, "bold"))
+            style.configure("HeaderCaption.TLabel", background="#FFFFFF", foreground=self.COLOR_GOLD, font=("Helvetica", 10, "bold"))
+            style.configure("HeaderTitle.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_PRIMARY, font=("Helvetica", 24, "bold"))
             style.configure("HeaderStatus.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_SECONDARY, font=("Helvetica", 10))
+            style.configure("HeroStatValue.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_PRIMARY, font=("Helvetica", 18, "bold"))
+            style.configure("HeroStatLabel.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_MUTED, font=("Helvetica", 10))
+            style.configure("SectionTitle.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_PRIMARY, font=("Helvetica", 13, "bold"))
+            style.configure("SectionDesc.TLabel", background="#FFFFFF", foreground=self.COLOR_TEXT_SECONDARY, font=("Helvetica", 10))
+            style.configure("StatusChip.TLabel", background=self.COLOR_ACCENT_SOFT, foreground=self.COLOR_ACCENT, padding=(10, 5), font=("Helvetica", 10, "bold"))
         except Exception:
             pass
 
     def _build_ui(self) -> None:
-        root = tb.Frame(self, padding=22, bootstyle="light")
+        root = tb.Frame(self, padding=18, bootstyle="light")
         root.pack(fill=BOTH, expand=True)
 
-        header = tb.Frame(root, bootstyle="light")
-        header.pack(side=TOP, fill=X, pady=(0, 16))
-        header_card = tb.Frame(header, bootstyle="light")
-        header_card.pack(fill=X)
-        tb.Label(header_card, text="私域营销数据传输工具", style="HeaderCaption.TLabel").pack(anchor="w")
-        tb.Label(header_card, text="批量文件上传", style="HeaderTitle.TLabel").pack(anchor="w", pady=(2, 0))
-        tb.Label(header_card, textvariable=self.var_status_bar, style="HeaderStatus.TLabel").pack(anchor="w", pady=(6, 0))
+        hero = tb.Frame(root, bootstyle="light")
+        hero.pack(side=TOP, fill=X, pady=(0, 16))
+        hero_card = tb.Frame(hero, bootstyle="light", padding=18)
+        hero_card.pack(fill=X)
 
-        action_row = tb.Frame(root, bootstyle="light")
-        action_row.pack(side=TOP, fill=X, pady=(0, 12))
+        hero_top = tb.Frame(hero_card, bootstyle="light")
+        hero_top.pack(fill=X)
+        hero_left = tb.Frame(hero_top, bootstyle="light")
+        hero_left.pack(side=LEFT, fill=X, expand=YES)
+        tb.Label(hero_left, text="私域营销数据传输工具", style="HeaderCaption.TLabel").pack(anchor="w")
+        tb.Label(hero_left, text="门店数据自动处理与上传", style="HeaderTitle.TLabel").pack(anchor="w", pady=(4, 0))
+        tb.Label(hero_left, text="把文件放进来，系统会自动处理、分批上传，并持续给出确定的进度反馈。", style="SectionDesc.TLabel").pack(anchor="w", pady=(6, 0))
+
+        hero_right = tb.Frame(hero_top, bootstyle="light")
+        hero_right.pack(side=RIGHT, anchor="n")
+        tb.Label(hero_right, textvariable=self.var_phase, style="StatusChip.TLabel").pack(anchor="e")
+
+        tb.Label(hero_card, textvariable=self.var_status_bar, style="HeaderStatus.TLabel").pack(anchor="w", pady=(12, 0))
+
+        stats_row = tb.Frame(hero_card, bootstyle="light")
+        stats_row.pack(fill=X, pady=(16, 0))
+        self._create_stat_card(stats_row, self.var_summary_files, "本次文件数").pack(side=LEFT, fill=X, expand=YES, padx=(0, 10))
+        self._create_stat_card(stats_row, self.var_summary_uploaded, "处理 / 上传条数").pack(side=LEFT, fill=X, expand=YES, padx=5)
+        self._create_stat_card(stats_row, self.var_summary_success, "成功文件").pack(side=LEFT, fill=X, expand=YES, padx=5)
+        self._create_stat_card(stats_row, self.var_summary_failed, "失败文件").pack(side=LEFT, fill=X, expand=YES, padx=(10, 0))
+
+        action_card = tb.Frame(root, bootstyle="light", padding=14)
+        action_card.pack(side=TOP, fill=X, pady=(0, 12))
+        tb.Label(action_card, text="操作区", style="SectionTitle.TLabel").pack(anchor="w")
+        tb.Label(action_card, text="建议先一次放齐文件，再点击开始；中途也可以继续添加。", style="SectionDesc.TLabel").pack(anchor="w", pady=(2, 10))
+        action_row = tb.Frame(action_card, bootstyle="light")
+        action_row.pack(fill=X)
         tb.Button(action_row, text="选择文件", command=self._on_pick_files, bootstyle="outline-dark").pack(side=LEFT)
         tb.Button(action_row, text="继续添加", command=self._on_add_more_files, bootstyle="outline-dark").pack(side=LEFT, padx=(10, 0))
         self.btn_process = tb.Button(action_row, text="开始处理", command=self._on_start_process, bootstyle="dark", width=14)
         self.btn_process.pack(side=LEFT, padx=(14, 0))
         tb.Button(action_row, text="停止", command=self._on_stop, bootstyle="outline-dark").pack(side=LEFT, padx=(8, 0))
-
-        summary_row = tb.Frame(root, bootstyle="light")
-        summary_row.pack(side=TOP, fill=X, pady=(0, 12))
-        summary_left = tb.Frame(summary_row, bootstyle="light")
-        summary_left.pack(side=LEFT, fill=X, expand=YES)
-        tb.Label(summary_left, textvariable=self.var_phase, font=("Helvetica", 11, "bold"), foreground=self.COLOR_TEXT_PRIMARY).pack(side=LEFT)
-        tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
-        tb.Label(summary_left, textvariable=self.var_summary_files, foreground=self.COLOR_TEXT_SECONDARY).pack(side=LEFT)
-        tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
-        tb.Label(summary_left, textvariable=self.var_summary_success, foreground=self.COLOR_TEXT_SECONDARY).pack(side=LEFT)
-        tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
-        tb.Label(summary_left, textvariable=self.var_summary_failed, foreground=self.COLOR_TEXT_SECONDARY).pack(side=LEFT)
-        tb.Label(summary_left, text="｜", foreground=self.COLOR_TEXT_MUTED).pack(side=LEFT, padx=10)
-        tb.Label(summary_left, textvariable=self.var_elapsed, foreground=self.COLOR_GOLD).pack(side=LEFT)
-        self.btn_clear_selected = tb.Button(summary_row, text="移除选中", command=self._on_remove_selected, bootstyle="link")
+        self.btn_clear_selected = tb.Button(action_row, text="移除选中", command=self._on_remove_selected, bootstyle="link")
         self.btn_clear_selected.pack(side=RIGHT)
 
-        progress_row = tb.Frame(root, bootstyle="light")
-        progress_row.pack(side=TOP, fill=X, pady=(0, 10))
-        self.progress_bar = tb.Progressbar(progress_row, maximum=100, value=0, bootstyle="warning-striped")
-        self.progress_bar.pack(fill=X)
-        self.progress_label = tb.Label(root, text="等待开始", foreground=self.COLOR_TEXT_SECONDARY)
-        self.progress_label.pack(anchor="w", pady=(0, 4))
-        self.step_label = tb.Label(root, textvariable=self.var_step_hint, foreground=self.COLOR_GOLD)
-        self.step_label.pack(anchor="w", pady=(0, 8))
+        progress_card = tb.Frame(root, bootstyle="light", padding=14)
+        progress_card.pack(side=TOP, fill=X, pady=(0, 12))
+        top_progress = tb.Frame(progress_card, bootstyle="light")
+        top_progress.pack(fill=X)
+        tb.Label(top_progress, text="执行进度", style="SectionTitle.TLabel").pack(side=LEFT)
+        tb.Label(top_progress, textvariable=self.var_elapsed, foreground=self.COLOR_GOLD).pack(side=RIGHT)
+        self.progress_bar = tb.Progressbar(progress_card, maximum=100, value=0, bootstyle="warning-striped")
+        self.progress_bar.pack(fill=X, pady=(10, 8))
+        self.progress_label = tb.Label(progress_card, text="等待开始", foreground=self.COLOR_TEXT_PRIMARY, font=("Helvetica", 11, "bold"))
+        self.progress_label.pack(anchor="w")
+        self.step_label = tb.Label(progress_card, textvariable=self.var_step_hint, foreground=self.COLOR_GOLD)
+        self.step_label.pack(anchor="w", pady=(4, 0))
+        tb.Label(progress_card, textvariable=self.var_progress_hint, style="SectionDesc.TLabel").pack(anchor="w", pady=(6, 0))
         self.completion_wrap = tb.Frame(root, bootstyle="light")
         self.completion_wrap.pack(fill=X, pady=(0, 10))
         self.completion_label = tb.Label(self.completion_wrap, textvariable=self.var_completion_note, style="CompletionSuccess.TLabel")
         self.completion_label.pack(anchor="w", fill=X)
         self.completion_wrap.pack_forget()
 
-        self.content_pane = tk.PanedWindow(root, orient=VERTICAL, sashrelief="flat", bd=0, bg="#EEE7DC")
+        content_header = tb.Frame(root, bootstyle="light")
+        content_header.pack(fill=X, pady=(0, 8))
+        tb.Label(content_header, text="文件与日志", style="SectionTitle.TLabel").pack(side=LEFT)
+        tb.Label(content_header, text="左侧看文件结果，右下可展开详细日志。", style="SectionDesc.TLabel").pack(side=LEFT, padx=(10, 0))
+
+        self.content_pane = tk.PanedWindow(root, orient=VERTICAL, sashrelief="flat", bd=0, bg="#EEE7DC", sashwidth=10, showhandle=False)
         self.content_pane.pack(side=TOP, fill=BOTH, expand=True, pady=(0, 10))
+        self.content_pane.configure(height=520)
 
-        list_box = tb.Frame(self.content_pane, bootstyle="light")
+        list_box = tb.Frame(self.content_pane, bootstyle="light", padding=10)
 
-        columns = ("file_name", "status", "uploaded_rows", "error")
+        columns = ("file_name", "status", "parsed_rows", "uploaded_rows", "error")
         self.files_tree = tb.Treeview(list_box, columns=columns, show="headings", height=14, style="Luxury.Treeview")
         headings = {
             "file_name": "文件名",
             "status": "结果",
+            "parsed_rows": "已处理",
             "uploaded_rows": "已上传",
             "error": "问题说明",
         }
         widths = {
             "file_name": 420,
             "status": 120,
+            "parsed_rows": 100,
             "uploaded_rows": 100,
-            "error": 420,
+            "error": 360,
         }
         for col in columns:
             self.files_tree.heading(col, text=headings[col])
@@ -249,12 +302,12 @@ class App(_AppBase):
         register_drop_target(self.files_tree, on_files=self._on_files_dropped, on_error=lambda m: self.bus.log(m))
         self.content_pane.add(list_box, stretch="always")
 
-        self.logs_frame = tb.Frame(self.content_pane, bootstyle="light")
+        self.logs_frame = tb.Frame(self.content_pane, bootstyle="light", padding=10)
         log_wrap = tb.Frame(self.logs_frame, bootstyle="light")
         log_wrap.pack(fill=BOTH, expand=True)
         self.log_text = tb.Text(
             log_wrap,
-            height=10,
+            height=14,
             wrap="none",
             relief="flat",
             bd=0,
@@ -286,6 +339,12 @@ class App(_AppBase):
         self.more_menu.add_separator()
         self.more_menu.add_command(label="帮助", command=self._show_help)
         self.more_menu.add_command(label="导出记录", command=self._export_logs)
+
+    def _create_stat_card(self, parent, value_var: tk.StringVar, label: str) -> tb.Frame:
+        card = tb.Frame(parent, bootstyle="light", padding=12)
+        tb.Label(card, textvariable=value_var, style="HeroStatValue.TLabel").pack(anchor="w")
+        tb.Label(card, text=label, style="HeroStatLabel.TLabel").pack(anchor="w", pady=(4, 0))
+        return card
 
     def _show_more_menu(self) -> None:
         try:
@@ -554,6 +613,7 @@ class App(_AppBase):
                 values=(
                     row.file_name,
                     row.status,
+                    row.parsed_rows,
                     row.uploaded_rows,
                     row.error or "—",
                 ),
@@ -616,7 +676,7 @@ class App(_AppBase):
             next_phase = status_map.get(summary.status, self._current_phase)
             if next_phase != self._current_phase:
                 self._set_phase(next_phase)
-            if self._current_phase == "待推送" and any(item.status == "上传中" for item in self._file_pool):
+            if self._current_phase == "正在准备推送" and any(item.status in {"上传中", "上传完成"} for item in self._file_pool):
                 self._set_phase("上传中")
         self._refresh_file_tree()
         self._refresh_summary()
@@ -648,7 +708,7 @@ class App(_AppBase):
         self.var_summary_files.set(f"文件：{total_files}")
         self.var_summary_success.set(f"成功：{success_files}")
         self.var_summary_failed.set(f"失败：{failed_files}")
-        self.var_summary_uploaded.set(f"已上传：{total_uploaded}")
+        self.var_summary_uploaded.set(f"已处理：{total_parsed}｜已上传：{total_uploaded}")
         elapsed_text = self._phase_elapsed_text()
         if self._current_phase in {"处理中", "正在准备推送", "上传中"}:
             self.var_elapsed.set(f"已持续：{elapsed_text}")
@@ -663,15 +723,15 @@ class App(_AppBase):
 
         if total_files > 0 and self._current_phase == "已完成":
             if failed_files == 0:
-                self.progress_label.configure(text=f"这次共 {total_files} 个文件，已全部处理完成")
+                self.progress_label.configure(text=f"这次共 {total_files} 个文件，已全部处理并上传完成")
                 self.var_completion_note.set("全部完成，可以直接继续下一批")
                 self.completion_label.configure(style="CompletionSuccess.TLabel")
-                self.completion_wrap.pack(fill=X, pady=(0, 10), before=self.files_tree.master)
+                self.completion_wrap.pack(fill=X, pady=(0, 10))
             else:
                 self.progress_label.configure(text=f"这次共 {total_files} 个文件，成功 {success_files} 个，失败 {failed_files} 个")
                 self.var_completion_note.set("有文件没处理成功，请看列表里的问题说明")
                 self.completion_label.configure(style="CompletionWarning.TLabel")
-                self.completion_wrap.pack(fill=X, pady=(0, 10), before=self.files_tree.master)
+                self.completion_wrap.pack(fill=X, pady=(0, 10))
 
         if total_files == 0:
             self.var_status_bar.set("请先把这次要处理的 Excel 文件放进来")
@@ -695,27 +755,28 @@ class App(_AppBase):
             self.var_progress_hint.set("已完成的结果会保留，未完成的文件可以重新检查或重新上传")
             self.var_completion_note.set("本次已停止")
             self.completion_label.configure(style="CompletionMuted.TLabel")
-            self.completion_wrap.pack(fill=X, pady=(0, 10), before=self.files_tree.master)
+            self.completion_wrap.pack(fill=X, pady=(0, 10))
             self._set_process_button_text("重新处理")
         elif self._current_phase == "正在准备推送":
             elapsed_text = self._phase_elapsed_text()
             self.var_status_bar.set(f"第 1 步已完成，正在整理上传数据（已持续 {elapsed_text}）")
-            self.var_progress_hint.set(f"本次已处理 {total_parsed} 条，马上自动进入上传；若此状态持续过久可查看日志排查")
-            self.var_step_hint.set("当前步骤：正在从第 1 步切换到第 2 步")
+            self.var_progress_hint.set(f"本次已处理 {total_parsed} 条，系统正在生成上传批次，请不要关闭窗口")
+            self.var_step_hint.set("当前步骤：正在进入第 2 步（上传数据）")
+            self.progress_label.configure(text=f"处理完成，共 {total_files} 个文件，已处理 {total_parsed} 条，正在生成上传批次")
             self._set_process_button_text("准备上传...")
         elif self._current_phase == "上传中":
             self.var_status_bar.set(f"第 2 步 / 2：正在上传数据，请稍候（共 {total_files} 个文件）")
-            self.var_progress_hint.set("上传过程中请不要关闭窗口")
+            self.var_progress_hint.set(f"上传过程中请不要关闭窗口｜已处理 {total_parsed} 条｜已上传 {total_uploaded} 条")
             self.var_step_hint.set("当前步骤：第 2 步（上传数据）")
             self._set_process_button_text("上传中...")
         elif self._current_phase == "已完成":
             self.var_step_hint.set("当前步骤：全部完成")
             if failed_files == 0:
-                self.var_status_bar.set(f"本次已全部完成，共成功处理 {success_files} 个文件")
-                self.var_progress_hint.set("可以关闭窗口，或继续添加新文件")
+                self.var_status_bar.set(f"本次已全部完成，共成功处理并上传 {success_files} 个文件")
+                self.var_progress_hint.set(f"本次共处理 {total_parsed} 条，已上传 {total_uploaded} 条；可以关闭窗口，或继续添加新文件")
             else:
                 self.var_status_bar.set(f"本次处理结束：成功 {success_files} 个，失败 {failed_files} 个")
-                self.var_progress_hint.set("请看列表里的问题说明，处理后再重新开始")
+                self.var_progress_hint.set(f"本次共处理 {total_parsed} 条，已上传 {total_uploaded} 条；请看列表里的问题说明，处理后再重新开始")
             self._set_process_button_text("继续处理新文件")
 
     def _on_start_process(self) -> None:
@@ -765,22 +826,19 @@ class App(_AppBase):
                 stop_flag=lambda: self._stop_event.is_set(),
                 session_id=self._current_session_id or None,
             )
-            self._current_session_id = stats.session_id
-            self._refresh_from_session()
-            self._set_phase("正在准备推送")
-            self._refresh_summary()
             processed_files = len(files)
-            self.bus.log(f"文件处理完成：本次共处理 {processed_files} 个文件，解析 {stats.parsed_rows} 条，开始继续推送")
-            # 解析线程结束后再切换到上传线程，否则会被“当前已有任务在运行”误拦截
-            self._worker = None
-            self.after(0, lambda: self._start_upload_stage(auto_started=True))
+            self.bus.log(f"文件处理完成：本次共处理 {processed_files} 个文件，解析 {stats.parsed_rows} 条，准备进入上传阶段")
+            self.bus.event(
+                "parse_finished",
+                session_id=stats.session_id,
+                auto_start_upload=True,
+            )
             return
         except Exception as e:
-            self._set_phase("已完成")
-            self.progress_label.configure(text="处理未完成")
             self.bus.log(f"文件检查失败: {e}")
+            self.bus.event("parse_failed")
         finally:
-            self._refresh_from_session()
+            self.bus.event("refresh_session")
 
     def _on_start_upload(self) -> None:
         self._start_upload_stage(auto_started=False)
@@ -796,11 +854,16 @@ class App(_AppBase):
         self._sync_config_from_ui()
         self._stop_event.clear()
         self._set_phase("上传中")
+        summary = self.batch_service.summary(self._current_session_id)
+        if summary:
+            self._upload_totals = (int(summary.uploaded_rows or 0), int(summary.total_rows or 0))
+        else:
+            self._upload_totals = (0, 0)
         self._refresh_summary()
         if auto_started:
-            self.bus.log("处理完成，系统已自动继续推送")
+            self.bus.log("处理完成，系统已自动进入上传阶段")
         else:
-            self.bus.log("开始推送本次文件")
+            self.bus.log("开始上传本次文件")
         self._worker = threading.Thread(target=self._worker_upload_run, daemon=True)
         self._worker.start()
 
@@ -815,17 +878,13 @@ class App(_AppBase):
                 stop_flag=lambda: self._stop_event.is_set(),
                 session_id=self._current_session_id or None,
             )
-            self._refresh_from_session()
             self.bus.log("推送阶段完成")
-            self.progress_bar.configure(value=100)
-            self.progress_label.configure(text="本次处理与推送已完成")
-            self.var_status_bar.set("本次处理与推送已完成")
+            self.bus.event("upload_finished")
         except Exception as e:
-            self._set_phase("已完成")
-            self.progress_label.configure(text="处理未完成")
             self.bus.log(f"上传失败: {e}")
+            self.bus.event("upload_failed")
         finally:
-            self._refresh_from_session()
+            self.bus.event("refresh_session")
 
     def _on_stop(self) -> None:
         if not (self._worker and self._worker.is_alive()):
@@ -835,6 +894,54 @@ class App(_AppBase):
         self._set_phase("已停止")
         self.progress_label.configure(text="正在停止，请稍候")
         self.bus.log("已请求停止当前操作")
+
+    def _on_worker_parse_finished(self, session_id: str, auto_start_upload: bool) -> None:
+        self._current_session_id = session_id
+        self._worker = None
+        self._set_phase("正在准备推送")
+        self._refresh_from_session()
+        self._refresh_summary()
+        if auto_start_upload:
+            self.after(50, lambda: self._start_upload_stage(auto_started=True))
+
+    def _on_worker_parse_failed(self) -> None:
+        self._worker = None
+        self._set_phase("已完成")
+        self.progress_label.configure(text="处理未完成")
+        self._refresh_from_session()
+        self._refresh_summary()
+
+    def _on_worker_upload_finished(self) -> None:
+        self._worker = None
+        self._refresh_from_session()
+        self.progress_bar.configure(value=100)
+        self.progress_label.configure(text="本次处理与上传已完成")
+        self.var_status_bar.set("本次处理与上传已完成")
+        self._refresh_summary()
+
+    def _on_worker_upload_failed(self) -> None:
+        self._worker = None
+        self._set_phase("已完成")
+        self.progress_label.configure(text="上传未完成")
+        self._refresh_from_session()
+        self._refresh_summary()
+
+    def _handle_bus_events(self) -> None:
+        for kind, payload in self.bus.drain_events():
+            if kind == "refresh_session":
+                if self._current_session_id:
+                    self._refresh_from_session()
+            elif kind == "parse_finished":
+                self._on_worker_parse_finished(
+                    session_id=str(payload.get("session_id") or ""),
+                    auto_start_upload=bool(payload.get("auto_start_upload", False)),
+                )
+            elif kind == "parse_failed":
+                self._on_worker_parse_failed()
+            elif kind == "upload_finished":
+                self._on_worker_upload_finished()
+            elif kind == "upload_failed":
+                self._on_worker_upload_failed()
 
     def _on_reset(self) -> None:
         if not Messagebox.okcancel("将清空本地待处理数据、本次批量记录，并解除熔断状态，是否继续？", "确认重置", parent=self):
@@ -871,21 +978,42 @@ class App(_AppBase):
                 self.log_text.see(END)
             self.log_text.configure(state="disabled")
 
+        self._handle_bus_events()
+
         snaps = self.bus.drain_progress()
         if snaps:
             snap = snaps[-1]
             pct = int((snap.current / snap.total) * 100) if snap.total > 0 else 0
             self.progress_bar.configure(value=pct)
             label = snap.message or f"{snap.current}/{snap.total}"
-            self.progress_label.configure(text=label)
+            if self._current_phase == "处理中":
+                self.progress_label.configure(text=f"正在处理：{label}")
+            elif self._current_phase == "上传中":
+                self.progress_label.configure(text=f"正在上传：{label}")
+            else:
+                self.progress_label.configure(text=label)
             if self._current_phase == "处理中":
                 self.var_status_bar.set(f"第 1 步 / 2：正在处理第 {snap.current}/{max(snap.total, 1)} 个文件")
+                self.var_step_hint.set("当前步骤：第 1 步（处理文件）")
                 self.var_progress_hint.set("文件较大时会比较久，请保持窗口开启")
             elif self._current_phase == "上传中":
+                uploaded_rows, total_rows = self._upload_totals
+                if self._current_session_id:
+                    summary = self.batch_service.summary(self._current_session_id)
+                    if summary:
+                        uploaded_rows = int(summary.uploaded_rows or 0)
+                        total_rows = int(summary.total_rows or 0)
+                        self._upload_totals = (uploaded_rows, total_rows)
                 self.var_status_bar.set(f"第 2 步 / 2：正在上传第 {snap.current}/{max(snap.total, 1)} 批")
-                self.var_progress_hint.set(f"上传过程中请不要关闭窗口｜当前批次 {snap.current}/{max(snap.total, 1)}")
+                self.var_step_hint.set("当前步骤：第 2 步（上传数据）")
+                if total_rows > 0:
+                    self.var_progress_hint.set(
+                        f"上传过程中请不要关闭窗口｜当前批次 {snap.current}/{max(snap.total, 1)}｜已上传 {uploaded_rows}/{total_rows} 条"
+                    )
+                else:
+                    self.var_progress_hint.set(f"上传过程中请不要关闭窗口｜当前批次 {snap.current}/{max(snap.total, 1)}")
 
-        if self._current_session_id:
+        if self._current_session_id and not (self._worker and self._worker.is_alive()):
             self._refresh_from_session()
 
         self.after(200, self._tick)
@@ -929,7 +1057,7 @@ class App(_AppBase):
 
     def _show_about(self) -> None:
         Messagebox.show_info(
-            "私域营销数据传输工具\n\n本工具支持一次加入多个 Excel，先检查，再按配置上传到对应 webhook。\n当前版本已经支持批量会话、分阶段处理和结果追踪。",
+            "私域营销数据传输工具\n\n本工具支持一次加入多个 Excel，先处理，再自动上传到对应 webhook。\n当前版本已经支持批量会话、分阶段处理和结果追踪。",
             "关于",
             parent=self,
         )
@@ -938,3 +1066,4 @@ class App(_AppBase):
 def run_app() -> None:
     app = App()
     app.mainloop()
+
