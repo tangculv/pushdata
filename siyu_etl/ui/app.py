@@ -124,6 +124,7 @@ class App(_AppBase):
         self.var_summary_uploaded = tb.StringVar(value="已上传：0")
         self.var_completion_note = tb.StringVar(value="")
         self.var_progress_hint = tb.StringVar(value="支持一次选多个文件，也可以后面继续添加")
+        self.var_step_hint = tb.StringVar(value="当前步骤：第 1 步（处理文件）｜第 2 步（上传数据）")
         self.var_elapsed = tb.StringVar(value="")
         self.var_logs_visible = tb.BooleanVar(value=False)
         self.var_platform_key = tb.StringVar(value=str(self.config_obj.platform_key))
@@ -209,7 +210,9 @@ class App(_AppBase):
         self.progress_bar = tb.Progressbar(progress_row, maximum=100, value=0, bootstyle="warning-striped")
         self.progress_bar.pack(fill=X)
         self.progress_label = tb.Label(root, text="等待开始", foreground=self.COLOR_TEXT_SECONDARY)
-        self.progress_label.pack(anchor="w", pady=(0, 6))
+        self.progress_label.pack(anchor="w", pady=(0, 4))
+        self.step_label = tb.Label(root, textvariable=self.var_step_hint, foreground=self.COLOR_GOLD)
+        self.step_label.pack(anchor="w", pady=(0, 8))
         self.completion_wrap = tb.Frame(root, bootstyle="light")
         self.completion_wrap.pack(fill=X, pady=(0, 10))
         self.completion_label = tb.Label(self.completion_wrap, textvariable=self.var_completion_note, style="CompletionSuccess.TLabel")
@@ -673,16 +676,19 @@ class App(_AppBase):
         if total_files == 0:
             self.var_status_bar.set("请先把这次要处理的 Excel 文件放进来")
             self.var_progress_hint.set("支持一次选多个文件，也可以后面继续添加")
+            self.var_step_hint.set("当前步骤：等待开始")
             self.progress_label.configure(text="等待开始")
             self._set_process_button_text("开始处理")
         elif self._current_phase == "待开始":
             self.var_status_bar.set(f"已经放入 {total_files} 个文件，确认后点一次开始就行")
             self.var_progress_hint.set("系统会自动处理并上传；如果文件还没加全，可以继续添加")
+            self.var_step_hint.set("当前步骤：等待点击开始")
             self.progress_label.configure(text="等待开始")
             self._set_process_button_text("开始处理")
         elif self._current_phase == "处理中":
-            self.var_status_bar.set(f"正在处理文件，请稍候（共 {total_files} 个）")
+            self.var_status_bar.set(f"第 1 步 / 2：正在处理文件，请稍候（共 {total_files} 个）")
             self.var_progress_hint.set("文件较大时会比较久，请保持窗口开启")
+            self.var_step_hint.set("当前步骤：第 1 步（处理文件）→ 完成后自动进入第 2 步（上传数据）")
             self._set_process_button_text("处理中...")
         elif self._current_phase == "已停止":
             self.var_status_bar.set("本次操作已停止，可继续调整文件后重新开始")
@@ -693,14 +699,17 @@ class App(_AppBase):
             self._set_process_button_text("重新处理")
         elif self._current_phase == "正在准备推送":
             elapsed_text = self._phase_elapsed_text()
-            self.var_status_bar.set(f"文件处理完成，系统正在准备推送（已持续 {elapsed_text}）")
-            self.var_progress_hint.set(f"本次已处理 {total_parsed} 条，请保持窗口开启；若此状态持续过久可查看日志排查")
-            self._set_process_button_text("准备推送...")
+            self.var_status_bar.set(f"第 1 步已完成，正在整理上传数据（已持续 {elapsed_text}）")
+            self.var_progress_hint.set(f"本次已处理 {total_parsed} 条，马上自动进入上传；若此状态持续过久可查看日志排查")
+            self.var_step_hint.set("当前步骤：正在从第 1 步切换到第 2 步")
+            self._set_process_button_text("准备上传...")
         elif self._current_phase == "上传中":
-            self.var_status_bar.set(f"正在上传文件，请稍候（共 {total_files} 个）")
+            self.var_status_bar.set(f"第 2 步 / 2：正在上传数据，请稍候（共 {total_files} 个文件）")
             self.var_progress_hint.set("上传过程中请不要关闭窗口")
+            self.var_step_hint.set("当前步骤：第 2 步（上传数据）")
             self._set_process_button_text("上传中...")
         elif self._current_phase == "已完成":
+            self.var_step_hint.set("当前步骤：全部完成")
             if failed_files == 0:
                 self.var_status_bar.set(f"本次已全部完成，共成功处理 {success_files} 个文件")
                 self.var_progress_hint.set("可以关闭窗口，或继续添加新文件")
@@ -870,11 +879,11 @@ class App(_AppBase):
             label = snap.message or f"{snap.current}/{snap.total}"
             self.progress_label.configure(text=label)
             if self._current_phase == "处理中":
-                self.var_status_bar.set(f"正在处理第 {snap.current}/{max(snap.total, 1)} 个文件")
+                self.var_status_bar.set(f"第 1 步 / 2：正在处理第 {snap.current}/{max(snap.total, 1)} 个文件")
                 self.var_progress_hint.set("文件较大时会比较久，请保持窗口开启")
             elif self._current_phase == "上传中":
-                self.var_status_bar.set(f"正在上传第 {snap.current}/{max(snap.total, 1)} 个文件")
-                self.var_progress_hint.set("上传过程中请不要关闭窗口")
+                self.var_status_bar.set(f"第 2 步 / 2：正在上传第 {snap.current}/{max(snap.total, 1)} 批")
+                self.var_progress_hint.set(f"上传过程中请不要关闭窗口｜当前批次 {snap.current}/{max(snap.total, 1)}")
 
         if self._current_session_id:
             self._refresh_from_session()
