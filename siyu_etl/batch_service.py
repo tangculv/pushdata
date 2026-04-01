@@ -13,6 +13,7 @@ from siyu_etl.db import (
     create_batch_session,
     get_batch_file,
     get_batch_session,
+    list_batch_sessions,
     get_tasks_count_by_file,
     list_batch_files,
     refresh_batch_session_counters,
@@ -70,6 +71,9 @@ class BatchService:
 
     def get_session(self, session_id: str) -> BatchSessionRecord | None:
         return get_batch_session(self.db_path, session_id=session_id)
+
+    def list_sessions(self, limit: int = 20) -> list[BatchSessionRecord]:
+        return list_batch_sessions(self.db_path, limit=limit)
 
     def update_file_status(self, *, file_id: str, status: str, **kwargs) -> None:
         update_batch_file_status(self.db_path, file_id=file_id, status=status, **kwargs)

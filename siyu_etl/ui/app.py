@@ -255,6 +255,7 @@ class App(_AppBase):
         self.btn_toggle_logs.pack(side=RIGHT)
 
         self.more_menu = Menu(self, tearoff=0)
+        self.more_menu.add_command(label="恢复上次未上传", command=self._on_resume_last_upload)
         self.more_menu.add_command(label="清空这次文件", command=self._on_clear_files)
         self.more_menu.add_command(label="清空本地记录", command=self._on_reset)
         self.more_menu.add_separator()
@@ -406,6 +407,55 @@ class App(_AppBase):
             self.bus.log("已移除选中的文件")
         self._refresh_file_tree()
         self._refresh_summary()
+
+    def _find_resumable_session_id(self) -> str:
+        for session in self.batch_service.list_sessions(limit=20):
+            pending = self.batch_service.count_session_tasks(session_id=session.session_id, status="PENDING")
+            if pending <= 0:
+                continue
+            if session.status in {"COMPLETED"}:
+                continue
+            return session.session_id
+        return ""
+
+    def _load_session_into_ui(self, session_id: str) -> bool:
+        files = self.batch_service.list_files(session_id)
+        if not files:
+            return False
+        self._file_pool = [
+            FileQueueItem(
+                path=Path(record.file_path),
+                file_name=record.file_name,
+                file_size=record.file_size,
+            )
+            for record in files
+        ]
+        self._current_session_id = session_id
+        self._refresh_from_session()
+        return True
+
+    def _on_resume_last_upload(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self.bus.log("当前已有任务在运行")
+            return
+        session_id = self._find_resumable_session_id()
+        if not session_id:
+            Messagebox.show_info("当前没有可恢复的未上传任务", "提示", parent=self)
+            return
+        if not self._load_session_into_ui(session_id):
+            Messagebox.show_warning("找到了本地任务，但恢复文件列表失败，请联系技术支持", "提示", parent=self)
+            return
+        pending = self.batch_service.count_session_tasks(session_id=session_id, status="PENDING")
+        self.bus.log(f"已恢复上次任务：{len(self._file_pool)} 个文件，待上传 {pending} 条")
+        if not Messagebox.okcancel(
+            f"已找到上次未上传完成的任务，共 {len(self._file_pool)} 个文件、待上传 {pending} 条，是否现在继续上传？",
+            "恢复上传",
+            parent=self,
+        ):
+            self._current_phase = "即将上传"
+            self._refresh_summary()
+            return
+        self._start_upload_stage(auto_started=False)
 
     def _on_clear_files(self) -> None:
         if not self._file_pool:

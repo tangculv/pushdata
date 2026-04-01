@@ -487,6 +487,32 @@ def list_batch_files(db_path: Path, *, session_id: str) -> list[BatchFileRecord]
     ]
 
 
+def list_batch_sessions(db_path: Path, *, limit: int = 20) -> list[BatchSessionRecord]:
+    with db_connection(Path(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM batch_sessions ORDER BY created_at DESC, rowid DESC LIMIT ?;",
+            (int(limit),),
+        ).fetchall()
+    return [
+        BatchSessionRecord(
+            session_id=str(row["session_id"]),
+            mode=str(row["mode"]),
+            status=str(row["status"]),
+            total_files=int(row["total_files"] or 0),
+            parsed_files=int(row["parsed_files"] or 0),
+            uploaded_files=int(row["uploaded_files"] or 0),
+            failed_files=int(row["failed_files"] or 0),
+            total_rows=int(row["total_rows"] or 0),
+            uploaded_rows=int(row["uploaded_rows"] or 0),
+            last_error=str(row["last_error"] or ""),
+            created_at=str(row["created_at"] or ""),
+            started_at=str(row["started_at"] or ""),
+            finished_at=str(row["finished_at"] or ""),
+        )
+        for row in rows
+    ]
+
+
 def get_batch_session(db_path: Path, *, session_id: str) -> BatchSessionRecord | None:
     with db_connection(Path(db_path)) as conn:
         row = conn.execute("SELECT * FROM batch_sessions WHERE session_id = ?;", (session_id,)).fetchone()
